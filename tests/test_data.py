@@ -20,6 +20,8 @@ from src.data import (
     find_bladesynth_normal_paths,
     load_agdd_source,
     load_aircraft_source,
+    load_group_manifest,
+    merge_leakage_groups,
     normalize_label,
     records_to_coco,
     sample_aebad_v_training_paths,
@@ -171,6 +173,33 @@ def test_duplicate_group_never_crosses_splits() -> None:
     memberships = {path: split for split, items in splits.items() for path in items}
     assert memberships["a"] == memberships["a_aug"]
     assert set(memberships) == set(paths)
+
+
+def test_explicit_acquisition_groups_and_frozen_split_never_leak(tmp_path: Path) -> None:
+    records = {}
+    for name in ("a.jpg", "b.jpg", "c.jpg"):
+        path = str((tmp_path / name).resolve())
+        records[path] = AircraftImageRecord(path, 100, 100, "source")
+    manifest = tmp_path / "groups.csv"
+    manifest.write_text(
+        "image,aircraft_id,inspection_session,camera_id,split\n"
+        "a.jpg,tail-1,visit-1,cam-a,test\n"
+        "b.jpg,tail-1,visit-2,cam-b,test\n"
+        "c.jpg,tail-2,visit-3,cam-c,train\n",
+        encoding="utf-8",
+    )
+    report = load_group_manifest(manifest, records)
+    assert report["matched"] == 3
+    groups = merge_leakage_groups(list(records), [], records)
+    fixed = {path: record.fixed_split for path, record in records.items() if record.fixed_split}
+    splits = _grouped_split(
+        list(records), groups, {"train": 0.7, "validation": 0.15, "test": 0.15}, 42,
+        fixed_splits=fixed,
+    )
+    assert set(splits["test"]) == {
+        str((tmp_path / "a.jpg").resolve()), str((tmp_path / "b.jpg").resolve())
+    }
+    assert splits["train"] == [str((tmp_path / "c.jpg").resolve())]
 
 
 def test_exact_duplicate_prefers_specific_annotation_over_composite_label() -> None:

@@ -92,13 +92,17 @@ The observed local counts, anomalies, and corrective actions are documented in
 2. Parse all Roboflow COCO split files plus supported Pascal VOC, YOLO, or LabelMe annotations.
 3. Normalize aliases while retaining original source/class fields.
 4. Validate AGDD rectangular boxes and create a separate auxiliary-pretraining split.
-5. Audit IMDD CSV/image agreement without inventing localization boxes.
+5. Audit IMDD CSV/image agreement without inventing localization boxes; include a separate reviewed
+   IMDD localization export only when its directory contains a `REVIEWED` marker.
 6. Exclude macOS archive metadata such as `._*.png` and `__MACOSX` from image discovery.
 7. Compute SHA-256 exact hashes plus pHash and dHash near-duplicate hashes.
 8. Conservatively group common augmented filename derivatives.
 9. Remove byte-exact copies and keep near/derivative groups in one split.
-10. Validate AeBAD-S masks, sample AeBAD-V normal frames per video, and accept only BladeSynth Normal images.
-11. Export train/validation/test COCO files and `reports/dataset_report.json` from observed data.
+10. If `paths.group_manifest` exists, union images sharing aircraft, tail, engine, blade, inspection,
+    video, camera, location, or group identifiers and honor validated frozen split assignments.
+11. Keep reviewed hard-negative images in training only.
+12. Validate AeBAD-S masks, sample AeBAD-V normal frames per video, and accept only BladeSynth Normal images.
+13. Export train/validation/test COCO files and `reports/dataset_report.json` from observed data.
 
 Full aircraft training uses the same capped inverse-square-root image sampler for both detectors to
 reduce class imbalance without making rare examples dominate every epoch.
@@ -110,9 +114,38 @@ experiment uses sampled normal AeBAD-V frames and only the explicit BladeSynth N
 AeBAD-S fine-tuning; its metrics remain outside the four-model comparison. PatchCore also stays
 AeBAD-S-only as a clean real-data baseline.
 
-IMDD can be upgraded later by manually annotating true defect boxes in a reviewed subset and exporting a
-new COCO dataset. Whole-image pseudo-boxes are deliberately unsupported because they teach localization
-models that the defect occupies the entire crop.
+IMDD can be upgraded with model-assisted proposals after the first detector is trained:
+
+```bash
+python scripts/bootstrap_imdd_boxes.py --config config.yaml
+```
+
+Import `data/annotation_tasks/imdd_proposals.json` and the IMDD images into CVAT or Roboflow, correct every
+selected image (including images where the model proposed no box), export COCO into the configured
+`imdd_localization` directory, and create an empty `REVIEWED` file there. Preparation ignores the export
+until that marker exists. Whole-image pseudo-boxes remain unsupported because they teach a false location.
+
+When acquisition identifiers are available, copy `docs/group_manifest.example.csv`, replace the example
+rows, and set `paths.group_manifest`. A public dataset that does not publish these identifiers cannot be
+made aircraft/session-aware by guessing filenames; duplicate, derivative, and perceptual grouping remains
+the fallback.
+
+### Post-deployment hard-negative rounds
+
+The application may first be deployed as an **assistive pilot**, not an autonomous airworthiness system.
+Place only human-confirmed defect-free pilot images in a normal pool, then run:
+
+```bash
+python scripts/mine_hard_negatives.py --normal-dir /path/to/confirmed-normal-pool --round 1 --confirmed-normal
+python scripts/prepare_data.py
+python scripts/train_aircraft.py --mode full
+python scripts/train_faster_rcnn.py --mode full
+```
+
+Repeat with `--round 2` and optionally `--round 3`. The miner selects images that produced false alarms,
+stores them as zero-annotation training images under `data/hard_negatives/reviewed`, and records every
+prediction in `mining_report.json`. Never apply `--confirmed-normal` to merely unlabeled images. Missed
+defects require a human to add real boxes; absence of a prediction cannot locate a missed defect.
 
 ## Deformable DETR
 
@@ -227,15 +260,17 @@ python scripts/evaluate.py --target all
 
 Aircraft output:
 
-- `reports/aircraft_metrics.json`: mAP@50, mAP@50:95, P/R/F1 at IoU 0.50, and latency.
-- `reports/aircraft_per_class.csv`: AP by normalized class.
+- `reports/aircraft_metrics.json`: mAP@50, mAP@50:95, small/medium/large AP, P/R/F1,
+  missed-defect rate, validation-selected deployment threshold, calibration error, and latency.
+- `reports/aircraft_per_class.csv`: AP, precision, recall, and missed-defect rate by class.
 - `reports/aircraft_predictions/predictions.json`: decoded final predictions.
 - `reports/aircraft_confusion_matrix.png`: class/background matrix at IoU 0.50.
 
 Engine output:
 
-- `reports/engine_metrics.json`: image AUROC, pixel AUROC, AUPRO, thresholded Dice/IoU, and latency.
-- `reports/engine_domain_metrics.csv`: metrics separated by AeBAD-S test domain when labels permit AUROC.
+- `reports/engine_metrics.json`: image AUROC, pixel AUROC, AUPRO, thresholded Dice/IoU, false alarms,
+  missed anomalies, sensitivity/specificity, balanced accuracy, and latency.
+- `reports/engine_domain_metrics.csv`: AUROC, false-alarm rate, and missed-anomaly rate by AeBAD-S domain.
 
 Undefined metrics (for example AUROC on a one-class subset) are stored as `null`, never coerced into a
 convincing number. The performance page displays “This model has not been evaluated yet” when files are
@@ -251,6 +286,9 @@ Navigation includes Dashboard, New Inspection, Batch Inspection, Inspection Hist
 and About / Methodology. The application loads only the selected model, caches it with
 `st.cache_resource`, streams batch processing one file at a time, stores real results in SQLite, and emits
 self-contained downloadable HTML reports. Missing checkpoints or uncalibrated MMR thresholds fail closed.
+Large aircraft images use overlapping 512-pixel crops plus full-frame inference and class-aware NMS.
+Training uses bbox-safe zoom crops and mild lighting, blur, noise, affine, and perspective variation so
+small cracks and scratches occupy more model pixels without extreme synthetic transformations.
 
 ## Docker
 
@@ -308,6 +346,8 @@ src/inference.py        Inspection and visualization APIs
 src/evaluation.py       COCO and anomaly metrics
 src/database.py         SQLite/SQLAlchemy persistence
 src/report.py           Downloadable HTML reports
+scripts/bootstrap_imdd_boxes.py  Unreviewed IMDD box proposals for CVAT/Roboflow correction
+scripts/mine_hard_negatives.py    Confirmed-normal false-positive mining rounds
 scripts/                Preparation, training, and frozen evaluation entry points
 tests/                  Fast unit and edge-case tests
 ```

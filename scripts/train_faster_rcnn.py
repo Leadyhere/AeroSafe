@@ -19,6 +19,7 @@ from src import load_config
 from src.baselines import FasterRCNNBaseline, FasterRCNNDataset, collate_faster_rcnn
 from src.data import detection_sampling_weights
 from src.evaluation import evaluate_aircraft_predictions
+from src.preprocessing import build_aircraft_augmentation
 
 
 def main() -> int:
@@ -53,8 +54,12 @@ def main() -> int:
         pretrained=True,
         confidence_threshold=float(config["aircraft"]["confidence_threshold"]),
     )
-    dataset = FasterRCNNDataset(train_file, train=True)
-    auxiliary_dataset = FasterRCNNDataset(auxiliary_file, train=True)
+    augmentation = build_aircraft_augmentation(
+        int(config["aircraft"]["image_size"]),
+        float(config["aircraft"].get("small_defect_crop_probability", 0.35)),
+    )
+    dataset = FasterRCNNDataset(train_file, train=True, transform=augmentation)
+    auxiliary_dataset = FasterRCNNDataset(auxiliary_file, train=True, transform=augmentation)
     train_sampler = None
     auxiliary_sampler = None
     if args.mode == "smoke":
@@ -148,7 +153,11 @@ def main() -> int:
                 model, validation_file, limit=2 if args.mode == "smoke" else None
             )
             metrics = evaluate_aircraft_predictions(
-                validation_file, predictions, report_dir, latencies_ms=latencies
+                validation_file,
+                predictions,
+                report_dir,
+                latencies_ms=latencies,
+                calibrate_threshold=True,
             )
         metadata = {
             "version": f"epoch-{epoch + 1}",
@@ -164,6 +173,7 @@ def main() -> int:
         }
         if metrics is not None and metrics["map_50_95"] >= best_map:
             best_map = float(metrics["map_50_95"])
+            model.confidence_threshold = float(metrics["recommended_confidence_threshold"])
             model.save(checkpoint_path, metadata)
         state_path.parent.mkdir(parents=True, exist_ok=True)
         torch.save(

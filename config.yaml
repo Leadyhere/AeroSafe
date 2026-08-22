@@ -4,6 +4,14 @@ paths:
   agdd: datasets/AGDD-main
   imdd_aircraft_images: datasets/0to4_aircraft_skin4000pics
   imdd_aircraft_csv: datasets/0-4aircraft4000.csv
+  # Reviewed detector annotations only. The directory is ignored unless it
+  # contains a REVIEWED marker plus COCO/VOC/YOLO/LabelMe annotations.
+  imdd_localization: datasets/imdd_localization_reviewed
+  # Optional model-mined images that a person has confirmed are defect-free.
+  hard_negatives: data/hard_negatives/reviewed
+  # Optional CSV: image plus any of aircraft_id, tail_number, engine_id,
+  # blade_id, inspection_session, video_id, camera_id, location_id, split.
+  group_manifest: datasets/aerosafe_group_manifest.csv
   aebad: datasets/AeBAD/AeBAD
   bladesynth: datasets/Dataset_bladesynth
   external_iisc: data/iisc_aircraft_skin
@@ -28,6 +36,7 @@ dataset:
   corrosion_min_examples: 30
   class_balance_max_sampling_weight: 4.0
   derivative_stem_patterns: ['_aug\d+$', '_copy\d*$', '_flip$', '_rot\d+$', '_resized$', '-aug\d+$']
+  require_review_marker: true
 
 aircraft:
   pretrained_model: SenseTime/deformable-detr
@@ -42,6 +51,13 @@ aircraft:
   max_grad_norm: 0.1
   image_size: 800
   auxiliary_pretrain_epochs: 3
+  tiled_inference:
+    enabled: true
+    tile_size: 512
+    overlap: 128
+    nms_iou: 0.45
+    min_image_size: 768
+  small_defect_crop_probability: 0.35
 
 engine:
   model: mmr

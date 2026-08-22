@@ -275,6 +275,7 @@ def main() -> int:
             evaluation_root,
             latencies_ms=latencies,
             pixel_threshold=pixel_threshold,
+            anomaly_threshold=anomaly_threshold,
         )
     print(
         f"Completed {args.mode} MMR variant={args.variant}; thresholds calibrated from "

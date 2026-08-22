@@ -82,12 +82,18 @@ def main() -> int:
     train_dataset = AircraftDetectionDataset(
         train_file,
         detector.processor,
-        transform=build_aircraft_augmentation(int(config["aircraft"]["image_size"])),
+        transform=build_aircraft_augmentation(
+            int(config["aircraft"]["image_size"]),
+            float(config["aircraft"].get("small_defect_crop_probability", 0.35)),
+        ),
     )
     auxiliary_dataset = AircraftDetectionDataset(
         auxiliary_file,
         detector.processor,
-        transform=build_aircraft_augmentation(int(config["aircraft"]["image_size"])),
+        transform=build_aircraft_augmentation(
+            int(config["aircraft"]["image_size"]),
+            float(config["aircraft"].get("small_defect_crop_probability", 0.35)),
+        ),
     )
     train_sampler = None
     auxiliary_sampler = None
@@ -194,7 +200,11 @@ def main() -> int:
                 detector, validation_file, 2 if args.mode == "smoke" else None
             )
             metrics = evaluate_aircraft_predictions(
-                validation_file, predictions, reports, latencies_ms=latencies
+                validation_file,
+                predictions,
+                reports,
+                latencies_ms=latencies,
+                calibrate_threshold=True,
             )
         metadata = {
             "version": f"epoch-{epoch + 1}",
@@ -210,6 +220,7 @@ def main() -> int:
         }
         if metrics is not None and metrics["map_50_95"] >= best_map:
             best_map = metrics["map_50_95"]
+            detector.confidence_threshold = float(metrics["recommended_confidence_threshold"])
             detector.save(checkpoint_destination, metadata)
         training_state.parent.mkdir(parents=True, exist_ok=True)
         torch.save(

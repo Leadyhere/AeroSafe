@@ -265,18 +265,49 @@ def analyze_duplicates(
     return DuplicateAnalysis(groups, exact_pairs, near_pairs, derivative_pairs, invalid, hashes)
 
 
-def build_aircraft_augmentation(image_size: int = 800):
-    """Return bbox-safe, physically mild aircraft training augmentation."""
+def build_aircraft_augmentation(
+    image_size: int = 800, small_defect_crop_probability: float = 0.35
+):
+    """Return bbox-safe, physically mild aircraft training augmentation.
+
+    RandomSizedBBoxSafeCrop zooms real annotated regions while preserving every
+    bounding box. This makes thin cracks/scratches occupy more model pixels
+    without relabeling cropped defect fragments as background.
+    """
     try:
         import albumentations as A
     except ImportError as exc:
         raise RuntimeError("Albumentations is required for aircraft training augmentation.") from exc
+    probability = float(small_defect_crop_probability)
+    if not 0 <= probability <= 1:
+        raise ValueError("small_defect_crop_probability must be between zero and one.")
     return A.Compose(
         [
-            A.LongestMaxSize(max_size=image_size),
-            A.PadIfNeeded(min_height=image_size, min_width=image_size, border_mode=cv2.BORDER_CONSTANT),
+            A.OneOf(
+                [
+                    A.RandomSizedBBoxSafeCrop(
+                        height=image_size,
+                        width=image_size,
+                        erosion_rate=0.05,
+                        p=probability,
+                    ),
+                    A.Compose(
+                        [
+                            A.LongestMaxSize(max_size=image_size),
+                            A.PadIfNeeded(
+                                min_height=image_size,
+                                min_width=image_size,
+                                border_mode=cv2.BORDER_REFLECT_101,
+                            ),
+                        ],
+                        p=max(0.0, 1.0 - probability),
+                    ),
+                ],
+                p=1.0,
+            ),
             A.HorizontalFlip(p=0.5),
             A.Affine(scale=(0.9, 1.1), rotate=(-5, 5), translate_percent=(-0.03, 0.03), p=0.5),
+            A.Perspective(scale=(0.01, 0.035), keep_size=True, p=0.12),
             A.RandomBrightnessContrast(brightness_limit=0.12, contrast_limit=0.12, p=0.35),
             A.GaussNoise(std_range=(0.01, 0.03), p=0.15),
             A.GaussianBlur(blur_limit=(3, 3), p=0.10),

@@ -19,6 +19,7 @@ from PIL import Image
 from .preprocessing import (
     SUPPORTED_IMAGE_EXTENSIONS,
     ImageValidationError,
+    UnionFind,
     analyze_duplicates,
     load_image,
     sha256_file,
@@ -55,6 +56,31 @@ class AircraftImageRecord:
     height: int
     source: str
     annotations: list[AircraftAnnotation] = field(default_factory=list)
+    leakage_keys: tuple[str, ...] = ()
+    fixed_split: str | None = None
+
+
+LEAKAGE_ID_FIELDS = (
+    "aircraft_id",
+    "tail_number",
+    "engine_id",
+    "blade_id",
+    "inspection_session",
+    "video_id",
+    "camera_id",
+    "location_id",
+    "group_id",
+)
+
+
+def _leakage_keys(metadata: Mapping[str, Any]) -> tuple[str, ...]:
+    """Return explicit acquisition identities; never guess them from pixels."""
+    keys = []
+    for field_name in LEAKAGE_ID_FIELDS:
+        value = str(metadata.get(field_name, "")).strip()
+        if value:
+            keys.append(f"{field_name}:{value.lower()}")
+    return tuple(sorted(set(keys)))
 
 
 def canonical_label(value: str) -> str:
@@ -148,7 +174,17 @@ def _records_from_coco(
                 annotations.append(
                     AircraftAnnotation(bbox, normalized, original, source, int(annotation.get("iscrowd", 0)))
                 )
-        records.append(AircraftImageRecord(str(image_path), image.width, image.height, source, annotations))
+        records.append(
+            AircraftImageRecord(
+                str(image_path),
+                image.width,
+                image.height,
+                source,
+                annotations,
+                leakage_keys=_leakage_keys(item),
+                fixed_split=str(item.get("split", "")).strip().lower() or None,
+            )
+        )
     return records
 
 
@@ -649,7 +685,11 @@ def audit_imdd_aircraft_subset(
 
 
 def _grouped_split(
-    paths: Sequence[str], groups: Sequence[Sequence[str]], ratios: Mapping[str, float], seed: int
+    paths: Sequence[str],
+    groups: Sequence[Sequence[str]],
+    ratios: Mapping[str, float],
+    seed: int,
+    fixed_splits: Mapping[str, str] | None = None,
 ) -> dict[str, list[str]]:
     names = ("train", "validation", "test")
     values = [float(ratios[name]) for name in names]
@@ -660,15 +700,100 @@ def _grouped_split(
     clean_groups = [group for group in clean_groups if group]
     covered = {path for group in clean_groups for path in group}
     clean_groups.extend([[path]] for path in sorted(path_set - covered))
+    fixed_splits = fixed_splits or {}
+    unknown_fixed = sorted(set(fixed_splits.values()) - set(names))
+    if unknown_fixed:
+        raise ValueError(f"Unknown fixed split names: {unknown_fixed}")
     random.Random(seed).shuffle(clean_groups)
     targets = dict(zip(names, (len(paths) * value for value in values)))
     result = {name: [] for name in names}
     # Largest groups first makes target counts and leakage control more stable.
     clean_groups.sort(key=len, reverse=True)
     for group in clean_groups:
-        split = max(names, key=lambda name: targets[name] - len(result[name]))
+        requested = {fixed_splits[path] for path in group if path in fixed_splits}
+        if len(requested) > 1:
+            raise DatasetConfigurationError(
+                f"One leakage group was assigned to multiple fixed splits: {sorted(requested)}"
+            )
+        split = next(iter(requested)) if requested else max(
+            names, key=lambda name: targets[name] - len(result[name])
+        )
         result[split].extend(group)
     return {key: sorted(value) for key, value in result.items()}
+
+
+def load_group_manifest(
+    path: str | Path,
+    records_by_path: Mapping[str, AircraftImageRecord],
+) -> dict[str, Any]:
+    """Apply user-supplied acquisition identities and optional frozen splits.
+
+    The manifest must identify an image by absolute/relative path or a unique
+    filename. Unknown and ambiguous rows fail closed so leakage controls cannot
+    silently target the wrong image.
+    """
+    path = Path(path)
+    if not path.is_file():
+        return {"present": False, "matched": 0, "rows": 0}
+    with path.open("r", encoding="utf-8-sig", newline="") as handle:
+        rows = list(csv.DictReader(handle))
+    if rows and "image" not in rows[0]:
+        raise DatasetConfigurationError(f"Group manifest requires an 'image' column: {path}")
+    by_name: dict[str, list[str]] = defaultdict(list)
+    for record_path in records_by_path:
+        by_name[Path(record_path).name.lower()].append(record_path)
+    matched = 0
+    for row_number, row in enumerate(rows, start=2):
+        image_value = str(row.get("image", "")).strip()
+        if not image_value:
+            raise DatasetConfigurationError(f"Empty image at {path}:{row_number}")
+        candidate = str(Path(image_value).resolve())
+        if candidate in records_by_path:
+            resolved = candidate
+        else:
+            candidates = by_name.get(Path(image_value).name.lower(), [])
+            if len(candidates) != 1:
+                raise DatasetConfigurationError(
+                    f"Group manifest image is missing or ambiguous at {path}:{row_number}: {image_value}"
+                )
+            resolved = candidates[0]
+        record = records_by_path[resolved]
+        record.leakage_keys = tuple(sorted(set(record.leakage_keys) | set(_leakage_keys(row))))
+        split = str(row.get("split", "")).strip().lower()
+        if split:
+            if split not in {"train", "validation", "test"}:
+                raise DatasetConfigurationError(
+                    f"Invalid manifest split {split!r} at {path}:{row_number}"
+                )
+            record.fixed_split = split
+        matched += 1
+    return {"present": True, "matched": matched, "rows": len(rows)}
+
+
+def merge_leakage_groups(
+    paths: Sequence[str],
+    duplicate_groups: Sequence[Sequence[str]],
+    records_by_path: Mapping[str, AircraftImageRecord],
+) -> list[list[str]]:
+    """Union duplicate/derivative groups with explicit acquisition identities."""
+    canonical = sorted(set(paths))
+    union = UnionFind(canonical)
+    allowed = set(canonical)
+    for group in duplicate_groups:
+        members = sorted(allowed.intersection(group))
+        for member in members[1:]:
+            union.union(members[0], member)
+    seen: dict[str, str] = {}
+    for path in canonical:
+        for key in records_by_path[path].leakage_keys:
+            if key in seen:
+                union.union(seen[key], path)
+            else:
+                seen[key] = path
+    grouped: dict[str, list[str]] = defaultdict(list)
+    for path in canonical:
+        grouped[union.find(path)].append(path)
+    return [sorted(group) for _, group in sorted(grouped.items())]
 
 
 def records_to_coco(
@@ -694,6 +819,8 @@ def records_to_coco(
                 "width": record.width,
                 "height": record.height,
                 "source": record.source,
+                "leakage_keys": list(record.leakage_keys),
+                **({"split": record.fixed_split} if record.fixed_split else {}),
             }
         )
         for annotation in record.annotations:
@@ -787,10 +914,25 @@ def prepare_aircraft_data(config: Mapping[str, Any]) -> dict[str, Any]:
     paths = config["paths"]
     labels = config["aircraft_labels"]
     dataset_config = config["dataset"]
-    sources = {
+    sources: dict[str, Path] = {
         "ASDD": Path(paths["asdd"]),
         "aircraftsurface1": Path(paths["aircraftsurface"]),
     }
+    optional_sources: dict[str, tuple[Path, bool]] = {
+        "IMDD-reviewed-localization": (Path(paths.get("imdd_localization", "")), False),
+        "verified-hard-negatives": (Path(paths.get("hard_negatives", "")), True),
+    }
+    optional_source_status: dict[str, str] = {}
+    require_marker = bool(dataset_config.get("require_review_marker", True))
+    for source, (root, _) in optional_sources.items():
+        if not str(root) or not root.is_dir():
+            optional_source_status[source] = "not present"
+            continue
+        if require_marker and not (root / "REVIEWED").is_file():
+            optional_source_status[source] = "ignored: missing REVIEWED marker"
+            continue
+        sources[source] = root
+        optional_source_status[source] = "included"
     all_records: list[AircraftImageRecord] = []
     source_annotation_audits = {
         source: audit_coco_source_annotations(root, labels) for source, root in sources.items()
@@ -800,6 +942,20 @@ def prepare_aircraft_data(config: Mapping[str, Any]) -> dict[str, Any]:
     discovered_paths: list[str] = []
     for source, root in sources.items():
         records = load_aircraft_source(root, source, labels)
+        if source == "IMDD-reviewed-localization":
+            missing_boxes = [record.path for record in records if not record.annotations]
+            if missing_boxes:
+                raise DatasetConfigurationError(
+                    "Reviewed IMDD localization contains images without a valid mapped box; "
+                    f"first: {missing_boxes[:3]}"
+                )
+        if source == "verified-hard-negatives":
+            if any(record.annotations for record in records):
+                raise DatasetConfigurationError(
+                    "Verified hard-negative sources must contain zero defect annotations."
+                )
+            for record in records:
+                record.fixed_split = "train"
         source_images = sorted(
             path for path in root.rglob("*")
             if _is_dataset_image(path)
@@ -817,6 +973,7 @@ def prepare_aircraft_data(config: Mapping[str, Any]) -> dict[str, Any]:
         derivative_patterns=dataset_config.get("derivative_stem_patterns", ()),
     )
     records_by_path = {str(Path(record.path).resolve()): record for record in all_records}
+    manifest_report = load_group_manifest(paths.get("group_manifest", ""), records_by_path)
     invalid_paths = {item["path"] for item in duplicate.invalid_images}
     exact_removed, exact_label_conflicts = _select_exact_duplicate_removals(
         records_by_path, duplicate.hashes
@@ -842,11 +999,18 @@ def prepare_aircraft_data(config: Mapping[str, Any]) -> dict[str, Any]:
             ]
     # Images with no compatible labels remain valid negative detector examples.
     record_paths = [str(Path(record.path).resolve()) for record in records]
+    leakage_groups = merge_leakage_groups(record_paths, duplicate.groups, records_by_path)
+    fixed_splits = {
+        path: records_by_path[path].fixed_split
+        for path in record_paths
+        if records_by_path[path].fixed_split is not None
+    }
     splits = _grouped_split(
         record_paths,
-        duplicate.groups,
+        leakage_groups,
         dataset_config["split"],
         int(config["training"]["seed"]),
+        fixed_splits=fixed_splits,
     )
     split_lookup = {path: split for split, split_paths in splits.items() for path in split_paths}
     processed_root = Path(paths["processed"]) / "aircraft"
@@ -897,6 +1061,9 @@ def prepare_aircraft_data(config: Mapping[str, Any]) -> dict[str, Any]:
         "source_counts": source_counts,
         "annotation_record_counts": annotation_record_counts,
         "source_annotation_audits": source_annotation_audits,
+        "optional_sources": optional_source_status,
+        "group_manifest": manifest_report,
+        "explicit_group_metadata_images": sum(bool(record.leakage_keys) for record in records),
         "images_discovered": len(discovered_paths),
         "valid_images": len(records),
         "invalid_images": duplicate.invalid_images,
@@ -920,7 +1087,12 @@ def prepare_aircraft_data(config: Mapping[str, Any]) -> dict[str, Any]:
             "cross_source_exact_duplicates_removed": len(cross_source_removed),
             "used_for_final_test": False,
         },
-        "integrity": {"duplicate_groups_kept_within_one_split": True, "external_iisc_used": False},
+        "integrity": {
+            "duplicate_groups_kept_within_one_split": True,
+            "explicit_acquisition_groups_kept_within_one_split": True,
+            "fixed_test_groups_never_used_for_training": True,
+            "external_iisc_used": False,
+        },
     }
 
 

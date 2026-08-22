@@ -108,6 +108,7 @@ def main() -> int:
             Path(config["paths"]["reports"]) / "baselines/patchcore",
             latencies_ms=result[5],
             pixel_threshold=pixel_threshold,
+            anomaly_threshold=anomaly_threshold,
         )
     print(
         f"Completed {args.mode} PatchCore fitting with {len(model.memory_bank)} coreset patches."

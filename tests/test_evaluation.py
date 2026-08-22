@@ -3,7 +3,14 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from src.evaluation import bbox_iou_xywh, compute_aupro, detection_prf, safe_auroc
+from src.evaluation import (
+    bbox_iou_xywh,
+    compute_aupro,
+    detection_calibration_error,
+    detection_prf,
+    safe_auroc,
+    select_detection_threshold,
+)
 
 
 def test_bbox_iou_and_detection_prf() -> None:
@@ -25,3 +32,16 @@ def test_undefined_auroc_is_none_and_nonfinite_rejected() -> None:
 def test_aupro_shape_validation() -> None:
     with pytest.raises(ValueError, match="identical"):
         compute_aupro(np.zeros((1, 4, 4)), np.zeros((1, 3, 3)))
+
+
+def test_detection_threshold_selection_and_calibration() -> None:
+    ground = [{"image_id": 1, "category_id": 1, "bbox": [0, 0, 10, 10]}]
+    predictions = [
+        {"image_id": 1, "category_id": 1, "bbox": [0, 0, 10, 10], "score": 0.8},
+        {"image_id": 1, "category_id": 1, "bbox": [20, 20, 5, 5], "score": 0.1},
+    ]
+    selected = select_detection_threshold(ground, predictions)
+    assert selected["f1"] == 1.0
+    assert 0.1 < selected["threshold"] <= 0.8
+    error = detection_calibration_error(ground, predictions, bins=5)
+    assert error is not None and 0 <= error <= 1

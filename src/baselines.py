@@ -21,7 +21,7 @@ def select_device():
 class FasterRCNNDataset:
     """COCO adapter for torchvision detectors with one-based model labels."""
 
-    def __init__(self, annotation_file: str | Path, *, train: bool = False):
+    def __init__(self, annotation_file: str | Path, *, train: bool = False, transform: Any = None):
         payload = json.loads(Path(annotation_file).read_text(encoding="utf-8"))
         self.images = sorted(payload["images"], key=lambda item: int(item["id"]))
         self.annotations: dict[int, list[dict[str, Any]]] = {}
@@ -33,6 +33,7 @@ class FasterRCNNDataset:
             category_id: offset + 1 for offset, category_id in enumerate(self.category_ids)
         }
         self.train = train
+        self.transform = transform
 
     def __len__(self) -> int:
         return len(self.images)
@@ -45,20 +46,28 @@ class FasterRCNNDataset:
 
         item = self.images[index]
         image = load_image(item["file_name"])
-        boxes, labels, areas, crowds = [], [], [], []
+        coco_boxes, labels = [], []
         for annotation in self.annotations.get(int(item["id"]), []):
             x, y, width, height = map(float, annotation["bbox"])
             x1, y1 = max(0.0, x), max(0.0, y)
             x2, y2 = min(float(image.width), x + width), min(float(image.height), y + height)
             if x2 <= x1 or y2 <= y1:
                 continue
-            boxes.append([x1, y1, x2, y2])
+            coco_boxes.append([x1, y1, x2 - x1, y2 - y1])
             labels.append(self.category_to_label[int(annotation["category_id"])])
-            areas.append((x2 - x1) * (y2 - y1))
-            crowds.append(int(annotation.get("iscrowd", 0)))
+        if self.train and self.transform is not None:
+            transformed = self.transform(
+                image=np.asarray(image), bboxes=coco_boxes, category_ids=labels
+            )
+            image = load_image(transformed["image"])
+            coco_boxes = [list(map(float, box)) for box in transformed["bboxes"]]
+            labels = [int(label) for label in transformed["category_ids"]]
+        boxes = [[x, y, x + width, y + height] for x, y, width, height in coco_boxes]
+        areas = [width * height for _, _, width, height in coco_boxes]
+        crowds = [0] * len(boxes)
         image_tensor = functional.pil_to_tensor(image).float().div(255)
         boxes_tensor = torch.as_tensor(boxes, dtype=torch.float32).reshape(-1, 4)
-        if self.train and torch.rand(()) < 0.5:
+        if self.train and self.transform is None and torch.rand(()) < 0.5:
             image_tensor = functional.hflip(image_tensor)
             if boxes_tensor.numel():
                 old_x1 = boxes_tensor[:, 0].clone()

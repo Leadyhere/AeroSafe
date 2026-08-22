@@ -62,6 +62,9 @@ paths:
   agdd: /kaggle/input/YOUR-AGDD-SLUG/AGDD-main
   imdd_aircraft_images: /kaggle/input/YOUR-IMDD-SLUG/0to4_aircraft_skin4000pics
   imdd_aircraft_csv: /kaggle/input/YOUR-IMDD-SLUG/0-4aircraft4000.csv
+  imdd_localization: /kaggle/input/YOUR-REVIEWED-IMDD-SLUG/imdd_localization_reviewed
+  hard_negatives: /kaggle/working/aeroinspect/data/hard_negatives/reviewed
+  group_manifest: /kaggle/input/YOUR-METADATA-SLUG/aerosafe_group_manifest.csv
   aebad: /kaggle/input/YOUR-AEBAD-SLUG/AeBAD/AeBAD
   bladesynth: /kaggle/input/YOUR-BLADESYNTH-SLUG/Dataset_bladesynth
   external_iisc: /kaggle/input/not-used
@@ -100,9 +103,31 @@ Scientific data use is intentionally staged:
   `reports/experiments/bladesynth_mmr/` rather than mixed into the four-model comparison.
 - PatchCore remains a clean real-data baseline fitted only on the same AeBAD-S normal split.
 
-To promote IMDD into detector training later, annotate true defect boxes for a reviewed subset in
-Roboflow or CVAT, export it as COCO, and add that export as a new boxed source. Keep the original CSV-only
-copy unchanged for image-level external checks. Do not auto-convert each full image into one box.
+After the first full Deformable DETR run, create IMDD proposals:
+
+```python
+!python scripts/bootstrap_imdd_boxes.py --config config.yaml
+```
+
+Download `data/annotation_tasks/imdd_proposals.json`, import it with the IMDD images into CVAT/Roboflow,
+correct every selected image, and export COCO. Put that reviewed export in a separate Kaggle Dataset with
+an empty file named `REVIEWED`, update `imdd_localization`, rerun preparation, and retrain both detectors.
+Unreviewed proposals and whole-image boxes are refused.
+
+If your datasets provide aircraft/tail/session/video/camera identifiers, attach a completed copy of
+`docs/group_manifest.example.csv`. If they do not, leave `group_manifest` pointing to a nonexistent path;
+the preparer still groups exact, near, and generated derivatives but reports zero explicit metadata.
+
+For post-deployment hard-negative rounds, upload only inspector-confirmed normal images and run round 1:
+
+```python
+!python scripts/mine_hard_negatives.py --normal-dir /kaggle/input/CONFIRMED-NORMALS --round 1 --confirmed-normal
+!python scripts/prepare_data.py --config config.yaml
+!python scripts/train_aircraft.py --mode full --config config.yaml
+!python scripts/train_faster_rcnn.py --mode full --config config.yaml
+```
+
+Repeat for rounds 2 and 3 after reviewing new pilot images. Unlabeled images are not confirmed normals.
 
 ## 6. Smoke-test, train, and evaluate
 

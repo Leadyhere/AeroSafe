@@ -4,7 +4,13 @@ import numpy as np
 import pytest
 from PIL import Image
 
-from src.inference import ModelNotReadyError, inspect_aircraft, inspect_engine
+from src.inference import (
+    ModelNotReadyError,
+    class_aware_nms,
+    inspect_aircraft,
+    inspect_engine,
+    predict_aircraft_tiled,
+)
 from src.preprocessing import ImageValidationError
 
 
@@ -73,3 +79,29 @@ def test_missing_threshold_fails_closed() -> None:
     model.anomaly_threshold = None
     with pytest.raises(ModelNotReadyError, match="validation-derived"):
         inspect_engine(Image.new("RGB", (160, 160), "gray"), model)
+
+
+def test_tiled_prediction_offsets_boxes_and_merges_overlap() -> None:
+    class TileModel:
+        last_inference_time_ms = 1.0
+
+        def predict(self, image, threshold=None):
+            self.last_inference_time_ms = 1.0
+            return [{"class": "crack", "confidence": 0.8, "bbox": [1, 2, 10, 12]}]
+
+    detections, elapsed = predict_aircraft_tiled(
+        TileModel(), Image.new("RGB", (700, 512)), tile_size=512, overlap=128,
+        include_full_frame=False,
+    )
+    assert len(detections) == 2
+    assert detections[1]["bbox"][0] == 189.0
+    assert elapsed == 2.0
+    merged = class_aware_nms(
+        [
+            {"class": "crack", "confidence": 0.9, "bbox": [0, 0, 10, 10]},
+            {"class": "crack", "confidence": 0.8, "bbox": [1, 1, 10, 10]},
+            {"class": "dent", "confidence": 0.7, "bbox": [1, 1, 10, 10]},
+        ],
+        0.5,
+    )
+    assert len(merged) == 2

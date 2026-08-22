@@ -39,7 +39,13 @@ def main() -> int:
         test_json = Path(config["paths"]["processed"]) / "aircraft" / "test.json"
         detector = AircraftDetector.load(config["aircraft"]["checkpoint"])
         predictions, latencies = collect_predictions(detector, test_json)
-        evaluate_aircraft_predictions(test_json, predictions, reports, latencies_ms=latencies)
+        evaluate_aircraft_predictions(
+            test_json,
+            predictions,
+            reports,
+            latencies_ms=latencies,
+            confidence_threshold=detector.confidence_threshold,
+        )
     if args.target in {"faster-rcnn", "all"}:
         test_json = Path(config["paths"]["processed"]) / "aircraft" / "test.json"
         detector = FasterRCNNBaseline.load(config["baselines"]["faster_rcnn"]["checkpoint"])
@@ -49,6 +55,7 @@ def main() -> int:
             predictions,
             reports / "baselines/faster_rcnn",
             latencies_ms=latencies,
+            confidence_threshold=detector.confidence_threshold,
         )
     if args.target in {"engine", "all"}:
         model = MaskedMultiScaleReconstruction.load_checkpoint(config["engine"]["checkpoint"])
@@ -70,7 +77,9 @@ def main() -> int:
                 latencies.append(prediction["inference_time_ms"])
         evaluate_engine_predictions(
             labels, scores, np.asarray(masks), np.asarray(maps), domains, reports,
-            latencies_ms=latencies, pixel_threshold=float(model.pixel_threshold)
+            latencies_ms=latencies,
+            pixel_threshold=float(model.pixel_threshold),
+            anomaly_threshold=float(model.anomaly_threshold),
         )
     if args.target in {"patchcore", "all"}:
         model = PatchCoreBaseline.load(config["baselines"]["patchcore"]["checkpoint"])
@@ -101,6 +110,7 @@ def main() -> int:
             reports / "baselines/patchcore",
             latencies_ms=latencies,
             pixel_threshold=float(model.pixel_threshold),
+            anomaly_threshold=float(model.anomaly_threshold),
         )
     if args.target == "external-aircraft":
         detector = AircraftDetector.load(config["aircraft"]["checkpoint"])
@@ -113,7 +123,11 @@ def main() -> int:
         records_to_coco(records, detector.labels, external_json)
         predictions, latencies = collect_predictions(detector, external_json)
         evaluate_aircraft_predictions(
-            external_json, predictions, external_root, latencies_ms=latencies
+            external_json,
+            predictions,
+            external_root,
+            latencies_ms=latencies,
+            confidence_threshold=detector.confidence_threshold,
         )
     if args.target == "all":
         metric_files = {

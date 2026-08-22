@@ -1,0 +1,4 @@
+image,aircraft_id,tail_number,engine_id,blade_id,inspection_session,video_id,camera_id,location_id,split
+/path/to/image_001.jpg,aircraft-001,VT-EXAMPLE,,,inspection-2026-08-23,,phone-a,hangar-1,test
+/path/to/image_002.jpg,aircraft-001,VT-EXAMPLE,,,inspection-2026-08-23,,phone-a,hangar-1,test
+/path/to/blade_001.jpg,,,engine-001,blade-01,borescope-2026-08-23,video-01,scope-a,hangar-1,train
