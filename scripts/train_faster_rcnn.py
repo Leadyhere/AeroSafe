@@ -17,12 +17,13 @@ if str(PROJECT_ROOT) not in sys.path:
 from scripts.train_aircraft import collect_predictions
 from src import load_config
 from src.baselines import FasterRCNNBaseline, FasterRCNNDataset, collate_faster_rcnn
+from src.data import detection_sampling_weights
 from src.evaluation import evaluate_aircraft_predictions
 
 
 def main() -> int:
     import torch
-    from torch.utils.data import DataLoader, Subset
+    from torch.utils.data import DataLoader, Subset, WeightedRandomSampler
 
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--mode", choices=("smoke", "full"), required=True)
@@ -54,20 +55,34 @@ def main() -> int:
     )
     dataset = FasterRCNNDataset(train_file, train=True)
     auxiliary_dataset = FasterRCNNDataset(auxiliary_file, train=True)
+    train_sampler = None
+    auxiliary_sampler = None
     if args.mode == "smoke":
         dataset = Subset(dataset, range(min(2, len(dataset))))
         auxiliary_dataset = Subset(auxiliary_dataset, range(min(2, len(auxiliary_dataset))))
+    else:
+        max_sampling_weight = float(
+            config["dataset"].get("class_balance_max_sampling_weight", 4.0)
+        )
+        train_weights = detection_sampling_weights(train_file, max_sampling_weight)
+        auxiliary_weights = detection_sampling_weights(auxiliary_file, max_sampling_weight)
+        train_sampler = WeightedRandomSampler(train_weights, len(train_weights), replacement=True)
+        auxiliary_sampler = WeightedRandomSampler(
+            auxiliary_weights, len(auxiliary_weights), replacement=True
+        )
     train_loader = DataLoader(
         dataset,
         batch_size=1 if args.mode == "smoke" else int(baseline["batch_size"]),
-        shuffle=True,
+        shuffle=train_sampler is None,
+        sampler=train_sampler,
         num_workers=0 if args.mode == "smoke" else int(config["training"]["num_workers"]),
         collate_fn=collate_faster_rcnn,
     )
     auxiliary_loader = DataLoader(
         auxiliary_dataset,
         batch_size=1 if args.mode == "smoke" else int(baseline["batch_size"]),
-        shuffle=True,
+        shuffle=auxiliary_sampler is None,
+        sampler=auxiliary_sampler,
         num_workers=0 if args.mode == "smoke" else int(config["training"]["num_workers"]),
         collate_fn=collate_faster_rcnn,
     )

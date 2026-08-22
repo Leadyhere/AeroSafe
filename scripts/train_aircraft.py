@@ -17,7 +17,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from src import load_config
 from src.aircraft_model import AircraftDetector, collate_detection_batch
-from src.data import AircraftDetectionDataset
+from src.data import AircraftDetectionDataset, detection_sampling_weights
 from src.evaluation import evaluate_aircraft_predictions
 from src.preprocessing import build_aircraft_augmentation, load_image
 
@@ -55,7 +55,7 @@ def collect_predictions(detector, annotation_file: Path, limit: int | None = Non
 
 def main() -> int:
     import torch
-    from torch.utils.data import DataLoader, Subset
+    from torch.utils.data import DataLoader, Subset, WeightedRandomSampler
 
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--mode", choices=("smoke", "full"), required=True)
@@ -89,20 +89,34 @@ def main() -> int:
         detector.processor,
         transform=build_aircraft_augmentation(int(config["aircraft"]["image_size"])),
     )
+    train_sampler = None
+    auxiliary_sampler = None
     if args.mode == "smoke":
         train_dataset = Subset(train_dataset, range(min(2, len(train_dataset))))
         auxiliary_dataset = Subset(auxiliary_dataset, range(min(2, len(auxiliary_dataset))))
+    else:
+        max_sampling_weight = float(
+            config["dataset"].get("class_balance_max_sampling_weight", 4.0)
+        )
+        train_weights = detection_sampling_weights(train_file, max_sampling_weight)
+        auxiliary_weights = detection_sampling_weights(auxiliary_file, max_sampling_weight)
+        train_sampler = WeightedRandomSampler(train_weights, len(train_weights), replacement=True)
+        auxiliary_sampler = WeightedRandomSampler(
+            auxiliary_weights, len(auxiliary_weights), replacement=True
+        )
     train_loader = DataLoader(
         train_dataset,
         batch_size=1 if args.mode == "smoke" else int(config["aircraft"]["batch_size"]),
-        shuffle=True,
+        shuffle=train_sampler is None,
+        sampler=train_sampler,
         num_workers=0 if args.mode == "smoke" else int(config["training"]["num_workers"]),
         collate_fn=partial(collate_detection_batch, processor=detector.processor),
     )
     auxiliary_loader = DataLoader(
         auxiliary_dataset,
         batch_size=1 if args.mode == "smoke" else int(config["aircraft"]["batch_size"]),
-        shuffle=True,
+        shuffle=auxiliary_sampler is None,
+        sampler=auxiliary_sampler,
         num_workers=0 if args.mode == "smoke" else int(config["training"]["num_workers"]),
         collate_fn=partial(collate_detection_batch, processor=detector.processor),
     )

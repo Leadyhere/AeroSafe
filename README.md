@@ -83,6 +83,9 @@ unrelated dataset and never infers detector labels from directory names.
 
 ## Dataset integrity
 
+The observed local counts, anomalies, and corrective actions are documented in
+[DATASET_AUDIT.md](DATASET_AUDIT.md).
+
 `scripts/prepare_data.py` performs these steps before training:
 
 1. Decode and validate supported images.
@@ -97,11 +100,19 @@ unrelated dataset and never infers detector labels from directory names.
 10. Validate AeBAD-S masks, sample AeBAD-V normal frames per video, and accept only BladeSynth Normal images.
 11. Export train/validation/test COCO files and `reports/dataset_report.json` from observed data.
 
+Full aircraft training uses the same capped inverse-square-root image sampler for both detectors to
+reduce class imbalance without making rare examples dominate every epoch.
+
 ASDD and aircraftsurface1 are re-split as a combined cleaned corpus after AGDD auxiliary pretraining.
 AeBAD-S keeps its official test boundary; a deterministic subset of real normal training images is held
-out only for threshold calibration. MMR's auxiliary phase uses sampled normal AeBAD-V frames and only the
-explicit BladeSynth Normal class before real AeBAD-S fine-tuning. PatchCore stays AeBAD-S-only so it
-remains a clean real-data baseline.
+out only for threshold calibration. The primary MMR remains AeBAD-S-only. A separately checkpointed MMR
+experiment uses sampled normal AeBAD-V frames and only the explicit BladeSynth Normal class before real
+AeBAD-S fine-tuning; its metrics remain outside the four-model comparison. PatchCore also stays
+AeBAD-S-only as a clean real-data baseline.
+
+IMDD can be upgraded later by manually annotating true defect boxes in a reviewed subset and exporting a
+new COCO dataset. Whole-image pseudo-boxes are deliberately unsupported because they teach localization
+models that the defect occupies the entire crop.
 
 ## Deformable DETR
 
@@ -184,10 +195,12 @@ python scripts/train_faster_rcnn.py --mode smoke
 python scripts/train_aircraft.py --mode full
 python scripts/train_faster_rcnn.py --mode full
 
-python scripts/train_engine.py --mode smoke
+python scripts/train_engine.py --mode smoke --variant real
 python scripts/train_patchcore.py --mode smoke
-python scripts/train_engine.py --mode full
+python scripts/train_engine.py --mode smoke --variant bladesynth
+python scripts/train_engine.py --mode full --variant real
 python scripts/train_patchcore.py --mode full
+python scripts/train_engine.py --mode full --variant bladesynth
 python scripts/evaluate.py --target all
 ```
 

@@ -1,4 +1,4 @@
-"""Run the reproducible four-model AeroInspect workflow on Kaggle."""
+"""Run four primary AeroInspect models plus the separate BladeSynth MMR experiment."""
 
 from __future__ import annotations
 
@@ -21,8 +21,27 @@ def training_commands(mode: str, config: str) -> list[list[str]]:
     return [
         [python, "scripts/train_aircraft.py", "--mode", mode, "--config", config],
         [python, "scripts/train_faster_rcnn.py", "--mode", mode, "--config", config],
-        [python, "scripts/train_engine.py", "--mode", mode, "--config", config],
+        [
+            python,
+            "scripts/train_engine.py",
+            "--mode",
+            mode,
+            "--variant",
+            "real",
+            "--config",
+            config,
+        ],
         [python, "scripts/train_patchcore.py", "--mode", mode, "--config", config],
+        [
+            python,
+            "scripts/train_engine.py",
+            "--mode",
+            mode,
+            "--variant",
+            "bladesynth",
+            "--config",
+            config,
+        ],
     ]
 
 
@@ -32,7 +51,10 @@ def main() -> int:
         "--stage",
         choices=("prepare", "smoke", "full", "evaluate", "all"),
         default="all",
-        help="all = prepare, smoke-test all four models, full training, then final evaluation",
+        help=(
+            "all = prepare, smoke-test four primary models plus the BladeSynth MMR experiment, "
+            "full training, then final evaluation"
+        ),
     )
     parser.add_argument("--config", default="config.yaml")
     args = parser.parse_args()

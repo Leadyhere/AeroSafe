@@ -1,4 +1,4 @@
-"""Train MMR on normal AeBAD-S images and calibrate thresholds on held-out normal validation data."""
+"""Train the real-only MMR or a separately reported BladeSynth auxiliary experiment."""
 
 from __future__ import annotations
 
@@ -43,6 +43,12 @@ def main() -> int:
 
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--mode", choices=("smoke", "full"), required=True)
+    parser.add_argument(
+        "--variant",
+        choices=("real", "bladesynth"),
+        default="real",
+        help="real = AeBAD-S only; bladesynth = separate synthetic-auxiliary experiment",
+    )
     parser.add_argument("--config", default="config.yaml")
     parser.add_argument("--resume", default=None)
     args = parser.parse_args()
@@ -53,14 +59,24 @@ def main() -> int:
     train_paths, validation_paths = split_aebad_training_paths(
         config["paths"]["aebad"], float(engine["validation_fraction"]), seed
     )
-    video_paths = sample_aebad_v_training_paths(
-        config["paths"]["aebad"], int(engine["aebad_v_frame_stride"])
-    )
-    synthetic_normal_paths = find_bladesynth_normal_paths(config["paths"]["bladesynth"])
-    if len(synthetic_normal_paths) < int(engine.get("bladesynth_min_normal_images", 1)):
-        parser.error("BladeSynth Normal class is incomplete. Run dataset preparation for details.")
-    auxiliary_paths = [*video_paths, *synthetic_normal_paths]
-    random.Random(seed).shuffle(auxiliary_paths)
+    video_paths: list[str] = []
+    synthetic_normal_paths: list[str] = []
+    auxiliary_paths: list[str] = []
+    if args.variant == "bladesynth":
+        video_paths = sample_aebad_v_training_paths(
+            config["paths"]["aebad"], int(engine["aebad_v_frame_stride"])
+        )
+        synthetic_normal_paths = find_bladesynth_normal_paths(config["paths"]["bladesynth"])
+        expected_bladesynth_normals = int(
+            engine.get("bladesynth_expected_images_per_class", 2500)
+        )
+        if len(synthetic_normal_paths) != expected_bladesynth_normals:
+            parser.error(
+                f"BladeSynth Normal has {len(synthetic_normal_paths)} images; expected "
+                f"{expected_bladesynth_normals}. Run dataset preparation for details."
+            )
+        auxiliary_paths = [*video_paths, *synthetic_normal_paths]
+        random.Random(seed).shuffle(auxiliary_paths)
     if args.mode == "smoke":
         train_paths, validation_paths = train_paths[:2], validation_paths[:2]
         auxiliary_paths = auxiliary_paths[:2]
@@ -82,9 +98,6 @@ def main() -> int:
     validation_dataset = AeBADDataset(
         config["paths"]["aebad"], "validation", image_size=int(engine["image_size"]), paths=validation_paths
     )
-    auxiliary_dataset = NormalImageDataset(
-        auxiliary_paths, image_size=int(engine["image_size"]), transform=train_transform
-    )
     train_loader = DataLoader(
         train_dataset,
         batch_size=1 if args.mode == "smoke" else int(engine["batch_size"]),
@@ -92,12 +105,17 @@ def main() -> int:
         num_workers=0 if args.mode == "smoke" else int(config["training"]["num_workers"]),
     )
     validation_loader = DataLoader(validation_dataset, batch_size=int(engine["batch_size"]), shuffle=False)
-    auxiliary_loader = DataLoader(
-        auxiliary_dataset,
-        batch_size=1 if args.mode == "smoke" else int(engine["batch_size"]),
-        shuffle=True,
-        num_workers=0 if args.mode == "smoke" else int(config["training"]["num_workers"]),
-    )
+    auxiliary_loader = None
+    if auxiliary_paths:
+        auxiliary_dataset = NormalImageDataset(
+            auxiliary_paths, image_size=int(engine["image_size"]), transform=train_transform
+        )
+        auxiliary_loader = DataLoader(
+            auxiliary_dataset,
+            batch_size=1 if args.mode == "smoke" else int(engine["batch_size"]),
+            shuffle=True,
+            num_workers=0 if args.mode == "smoke" else int(config["training"]["num_workers"]),
+        )
     model = MaskedMultiScaleReconstruction(
         image_size=int(engine["image_size"]),
         teacher_backbone=engine["teacher_backbone"],
@@ -110,14 +128,21 @@ def main() -> int:
         weight_decay=float(engine["weight_decay"]),
     )
     main_epochs = 1 if args.mode == "smoke" else int(engine["epochs"])
-    auxiliary_epochs = 1 if args.mode == "smoke" else int(engine["auxiliary_pretrain_epochs"])
+    auxiliary_epochs = (
+        (1 if args.mode == "smoke" else int(engine["auxiliary_pretrain_epochs"]))
+        if args.variant == "bladesynth"
+        else 0
+    )
     total_epochs = auxiliary_epochs + main_epochs
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, max(1, total_epochs))
     amp_enabled = bool(config["training"]["mixed_precision"]) and model.device.type == "cuda"
     scaler = torch.amp.GradScaler("cuda", enabled=amp_enabled)
     checkpoint_root = Path(config["paths"]["checkpoints"])
+    variant_suffix = "" if args.variant == "real" else "_bladesynth"
     training_state = checkpoint_root / (
-        "smoke/engine_training_state.pt" if args.mode == "smoke" else "engine_training_state.pt"
+        f"smoke/engine{variant_suffix}_training_state.pt"
+        if args.mode == "smoke"
+        else f"engine{variant_suffix}_training_state.pt"
     )
     start_epoch = 0
     if args.resume:
@@ -131,6 +156,8 @@ def main() -> int:
     for epoch in range(start_epoch, total_epochs):
         phase = "auxiliary_pretraining" if epoch < auxiliary_epochs else "aebad_s_finetuning"
         active_loader = auxiliary_loader if phase == "auxiliary_pretraining" else train_loader
+        if active_loader is None:
+            raise RuntimeError("Auxiliary MMR phase was selected without auxiliary data.")
         model.train()
         for batch in active_loader:
             images = batch["image"].to(model.device)
@@ -185,6 +212,7 @@ def main() -> int:
             "score_max": float(np.max(validation_scores)),
         },
         "training_phases": {
+            "variant": args.variant,
             "auxiliary_epochs": auxiliary_epochs,
             "aebad_s_epochs": main_epochs,
             "aebad_v_sampled_normals": len(video_paths),
@@ -198,9 +226,13 @@ def main() -> int:
         "config": config,
     }
     checkpoint_destination = (
-        checkpoint_root / "smoke/engine_best.pt"
+        checkpoint_root / f"smoke/engine{variant_suffix}_best.pt"
         if args.mode == "smoke"
-        else Path(engine["checkpoint"])
+        else Path(
+            engine["checkpoint"]
+            if args.variant == "real"
+            else engine["bladesynth_checkpoint"]
+        )
     )
     model.save_checkpoint(checkpoint_destination, metadata)
     torch.save(
@@ -229,19 +261,24 @@ def main() -> int:
                 scores.append(prediction["anomaly_score"])
                 maps.append(prediction["anomaly_map"])
                 latencies.append(prediction["inference_time_ms"])
+        evaluation_root = (
+            Path(config["paths"]["reports"])
+            if args.variant == "real"
+            else Path(config["paths"]["reports"]) / "experiments/bladesynth_mmr"
+        )
         evaluate_engine_predictions(
             labels,
             scores,
             np.asarray(masks),
             np.asarray(maps),
             domains,
-            config["paths"]["reports"],
+            evaluation_root,
             latencies_ms=latencies,
             pixel_threshold=pixel_threshold,
         )
     print(
-        f"Completed {args.mode} MMR two-stage training; thresholds calibrated from held-out "
-        "AeBAD-S normal validation data."
+        f"Completed {args.mode} MMR variant={args.variant}; thresholds calibrated from "
+        "held-out AeBAD-S normal validation data."
     )
     return 0
 

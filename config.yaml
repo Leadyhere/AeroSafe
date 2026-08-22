@@ -26,6 +26,7 @@ dataset:
   split: {train: 0.70, validation: 0.15, test: 0.15}
   near_duplicate_hamming: 6
   corrosion_min_examples: 30
+  class_balance_max_sampling_weight: 4.0
   derivative_stem_patterns: ['_aug\d+$', '_copy\d*$', '_flip$', '_rot\d+$', '_resized$', '-aug\d+$']
 
 aircraft:
@@ -45,6 +46,7 @@ aircraft:
 engine:
   model: mmr
   checkpoint: checkpoints/engine_best.pt
+  bladesynth_checkpoint: checkpoints/engine_bladesynth_best.pt
   teacher_backbone: wide_resnet50_2.tv2_in1k
   mae_backbone: vit_base_patch16_224.mae
   image_size: 224
@@ -60,7 +62,7 @@ engine:
   pixel_threshold: null
   auxiliary_pretrain_epochs: 5
   aebad_v_frame_stride: 10
-  bladesynth_min_normal_images: 2500
+  bladesynth_expected_images_per_class: 2500
 
 baselines:
   faster_rcnn:

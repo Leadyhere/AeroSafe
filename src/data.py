@@ -21,6 +21,7 @@ from .preprocessing import (
     ImageValidationError,
     analyze_duplicates,
     load_image,
+    sha256_file,
 )
 
 
@@ -77,9 +78,17 @@ def normalize_label(value: str, label_config: Mapping[str, Sequence[str]]) -> st
 
 
 def _valid_bbox(bbox: Sequence[float], width: int, height: int) -> list[float] | None:
-    if len(bbox) != 4 or not all(np.isfinite(float(item)) for item in bbox):
+    try:
+        if len(bbox) != 4:
+            return None
+    except TypeError:
         return None
-    x, y, w, h = map(float, bbox)
+    try:
+        x, y, w, h = map(float, bbox)
+    except (TypeError, ValueError):
+        return None
+    if not all(np.isfinite(item) for item in (x, y, w, h)):
+        return None
     x = max(0.0, min(x, float(width)))
     y = max(0.0, min(y, float(height)))
     w = max(0.0, min(w, float(width) - x))
@@ -333,6 +342,124 @@ def load_aircraft_source(
     )
 
 
+def audit_coco_source_annotations(
+    root: str | Path,
+    label_config: Mapping[str, Sequence[str]],
+) -> dict[str, Any]:
+    """Report raw COCO integrity issues that normalization later repairs or excludes."""
+    root = Path(root)
+    image_index = _image_index(root)
+    files: dict[str, Any] = {}
+    totals: Counter[str] = Counter()
+    total_raw_classes: Counter[str] = Counter()
+    total_normalized_classes: Counter[str] = Counter()
+    for annotation_path in sorted(root.rglob("*.json")):
+        try:
+            payload = json.loads(annotation_path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            continue
+        if not all(key in payload for key in ("images", "annotations", "categories")):
+            continue
+        categories = {int(item["id"]): str(item["name"]) for item in payload["categories"]}
+        images = {int(item["id"]): item for item in payload["images"]}
+        annotation_counts: Counter[int] = Counter()
+        raw_classes: Counter[str] = Counter()
+        normalized_classes: Counter[str] = Counter()
+        missing_image_references = 0
+        missing_category_references = 0
+        invalid_boxes = 0
+        boxes_outside_declared_bounds = 0
+        unmapped_annotations = 0
+        for annotation in payload["annotations"]:
+            image_id = int(annotation["image_id"])
+            category_id = int(annotation["category_id"])
+            annotation_counts[image_id] += 1
+            image = images.get(image_id)
+            original = categories.get(category_id)
+            if image is None:
+                missing_image_references += 1
+                continue
+            if original is None:
+                missing_category_references += 1
+                continue
+            raw_classes[original] += 1
+            normalized = normalize_label(original, label_config)
+            if normalized is None:
+                unmapped_annotations += 1
+            else:
+                normalized_classes[normalized] += 1
+            bbox = annotation.get("bbox", [])
+            try:
+                numeric_bbox = list(map(float, bbox))
+            except (TypeError, ValueError):
+                numeric_bbox = []
+            if (
+                len(numeric_bbox) != 4
+                or not all(np.isfinite(item) for item in numeric_bbox)
+                or numeric_bbox[2] <= 0
+                or numeric_bbox[3] <= 0
+            ):
+                invalid_boxes += 1
+                continue
+            x, y, width, height = numeric_bbox
+            if (
+                x < 0
+                or y < 0
+                or x + width > float(image["width"])
+                or y + height > float(image["height"])
+            ):
+                boxes_outside_declared_bounds += 1
+        missing_files = sum(
+            _find_image(annotation_path.parent, str(image["file_name"]), image_index) is None
+            for image in images.values()
+        )
+        category_name_counts = Counter(canonical_label(name) for name in categories.values())
+        duplicate_category_names = sorted(
+            name for name, count in category_name_counts.items() if count > 1
+        )
+        unused_categories = sorted(
+            name for category_id, name in categories.items()
+            if not any(int(item["category_id"]) == category_id for item in payload["annotations"])
+        )
+        summary = {
+            "images": len(images),
+            "annotations": len(payload["annotations"]),
+            "unannotated_images": sum(annotation_counts[image_id] == 0 for image_id in images),
+            "missing_image_files": missing_files,
+            "missing_image_references": missing_image_references,
+            "missing_category_references": missing_category_references,
+            "invalid_boxes": invalid_boxes,
+            "boxes_outside_declared_bounds_clipped_during_loading": boxes_outside_declared_bounds,
+            "unmapped_annotations_excluded": unmapped_annotations,
+            "duplicate_category_names": duplicate_category_names,
+            "unused_categories": unused_categories,
+            "raw_class_distribution": dict(sorted(raw_classes.items())),
+            "normalized_class_distribution": dict(sorted(normalized_classes.items())),
+        }
+        relative = str(annotation_path.relative_to(root))
+        files[relative] = summary
+        for key in (
+            "images",
+            "annotations",
+            "unannotated_images",
+            "missing_image_files",
+            "missing_image_references",
+            "missing_category_references",
+            "invalid_boxes",
+            "boxes_outside_declared_bounds_clipped_during_loading",
+            "unmapped_annotations_excluded",
+        ):
+            totals[key] += int(summary[key])
+        total_raw_classes.update(raw_classes)
+        total_normalized_classes.update(normalized_classes)
+    return {
+        "totals": dict(totals),
+        "raw_class_distribution": dict(sorted(total_raw_classes.items())),
+        "normalized_class_distribution": dict(sorted(total_normalized_classes.items())),
+        "annotation_files": files,
+    }
+
+
 def load_agdd_source(
     root: str | Path,
     label_config: Mapping[str, Sequence[str]],
@@ -446,16 +573,77 @@ def audit_imdd_aircraft_subset(
     class_counts = Counter(
         canonical_label(str(row["Categories"]).split(",")[-1]) for row in rows
     )
+    rows_by_name = {str(row["Image Name"]).strip().lower(): row for row in rows}
+    folder_label_mismatches = []
+    category_to_ids: dict[str, set[str]] = defaultdict(set)
+    id_to_categories: dict[str, set[str]] = defaultdict(set)
+    exact_hashes: dict[str, list[str]] = defaultdict(list)
+    dimensions: Counter[str] = Counter()
+    monochrome_images = 0
+    black_border_images = 0
+    for path in images:
+        row = rows_by_name[path.name.lower()]
+        category = canonical_label(str(row["Categories"]).split(",")[-1])
+        label_id = str(row["label"]).strip()
+        category_to_ids[category].add(label_id)
+        id_to_categories[label_id].add(category)
+        if canonical_label(path.parent.name) != category:
+            folder_label_mismatches.append(path.name)
+        try:
+            image = load_image(path)
+        except ImageValidationError as exc:
+            raise DatasetConfigurationError(f"Invalid IMDD image {path}: {exc}") from exc
+        pixels = np.asarray(image)
+        dimensions[f"{image.width}x{image.height}"] += 1
+        monochrome_images += int(
+            np.array_equal(pixels[:, :, 0], pixels[:, :, 1])
+            and np.array_equal(pixels[:, :, 1], pixels[:, :, 2])
+        )
+        edge = np.concatenate(
+            [pixels[0, :, 0], pixels[-1, :, 0], pixels[:, 0, 0], pixels[:, -1, 0]]
+        )
+        black_border_images += int(float(np.mean(edge <= 5)) > 0.10)
+        exact_hashes[sha256_file(path)].append(path.name)
+    exact_duplicate_groups = [group for group in exact_hashes.values() if len(group) > 1]
+    if folder_label_mismatches:
+        raise DatasetConfigurationError(
+            f"IMDD has {len(folder_label_mismatches)} folder/CSV label mismatches; first: "
+            f"{folder_label_mismatches[:5]}"
+        )
+    inconsistent_categories = {
+        category: sorted(ids) for category, ids in category_to_ids.items() if len(ids) != 1
+    }
+    inconsistent_ids = {
+        label_id: sorted(categories)
+        for label_id, categories in id_to_categories.items()
+        if len(categories) != 1
+    }
+    if inconsistent_categories or inconsistent_ids:
+        raise DatasetConfigurationError(
+            "IMDD numeric labels and category names are not one-to-one: "
+            f"categories={inconsistent_categories}, ids={inconsistent_ids}"
+        )
+    smallest_class = min(class_counts.values())
+    largest_class = max(class_counts.values())
     return {
         "images": len(images),
         "csv_rows": len(rows),
         "unreferenced_images": len(unreferenced),
         "class_distribution": dict(sorted(class_counts.items())),
+        "class_imbalance_largest_to_smallest": round(largest_class / smallest_class, 3),
+        "dimensions": dict(sorted(dimensions.items())),
+        "monochrome_images": monochrome_images,
+        "black_border_images_over_10_percent_edge": black_border_images,
+        "exact_duplicate_groups": len(exact_duplicate_groups),
+        "folder_csv_label_mismatches": 0,
         "annotation_level": "image_classification_and_text",
         "has_localization_boxes": False,
         "used_for_detector_training": False,
         "exclusion_reason": (
             "The CSV has image-level labels/descriptions but no bounding boxes; detector boxes are never invented."
+        ),
+        "recommended_use": (
+            "External image-level presence evaluation or manual box annotation; not localization training."
         ),
     }
 
@@ -531,6 +719,70 @@ def records_to_coco(
     return output
 
 
+def _select_exact_duplicate_removals(
+    records_by_path: Mapping[str, AircraftImageRecord],
+    hashes: Mapping[str, Mapping[str, str]],
+) -> tuple[set[str], int]:
+    """Choose the best-labeled representative of each byte-identical image group."""
+    exact_hash_groups: dict[str, list[str]] = defaultdict(list)
+    for path, image_hashes in hashes.items():
+        if path in records_by_path:
+            exact_hash_groups[image_hashes["sha256"]].append(path)
+    removed: set[str] = set()
+    label_conflicts = 0
+    for group in exact_hash_groups.values():
+        if len(group) < 2:
+            continue
+        label_sets = {
+            tuple(sorted({annotation.normalized_class for annotation in records_by_path[path].annotations}))
+            for path in group
+        }
+        label_conflicts += int(len(label_sets) > 1)
+
+        def annotation_quality(path: str) -> tuple[int, int, int, int, str]:
+            record = records_by_path[path]
+            labels_for_record = {annotation.normalized_class for annotation in record.annotations}
+            specific = labels_for_record - {"surface_damage"}
+            # Prefer specific classes and richer annotations. aircraftsurface1 is
+            # the tie-breaker because ASDD's composite label is intentionally broad.
+            source_preference = int(record.source == "aircraftsurface1")
+            return len(specific), len(labels_for_record), len(record.annotations), source_preference, path
+
+        preferred = max(group, key=annotation_quality)
+        removed.update(path for path in group if path != preferred)
+    return removed, label_conflicts
+
+
+def detection_sampling_weights(
+    annotation_file: str | Path,
+    max_weight: float = 4.0,
+) -> list[float]:
+    """Build capped inverse-square-root image weights for imbalanced detector classes."""
+    if max_weight < 1:
+        raise ValueError("Detector maximum sampling weight must be at least one.")
+    payload = json.loads(Path(annotation_file).read_text(encoding="utf-8"))
+    images = sorted(payload["images"], key=lambda item: int(item["id"]))
+    image_categories: dict[int, set[int]] = defaultdict(set)
+    for annotation in payload["annotations"]:
+        image_categories[int(annotation["image_id"])].add(int(annotation["category_id"]))
+    category_image_counts: Counter[int] = Counter(
+        category_id
+        for category_ids in image_categories.values()
+        for category_id in category_ids
+    )
+    if not category_image_counts:
+        return [1.0] * len(images)
+    majority = max(category_image_counts.values())
+    category_weights = {
+        category_id: min(max_weight, float(np.sqrt(majority / count)))
+        for category_id, count in category_image_counts.items()
+    }
+    return [
+        max((category_weights[category_id] for category_id in image_categories[int(image["id"])]), default=1.0)
+        for image in images
+    ]
+
+
 def prepare_aircraft_data(config: Mapping[str, Any]) -> dict[str, Any]:
     paths = config["paths"]
     labels = config["aircraft_labels"]
@@ -540,6 +792,9 @@ def prepare_aircraft_data(config: Mapping[str, Any]) -> dict[str, Any]:
         "aircraftsurface1": Path(paths["aircraftsurface"]),
     }
     all_records: list[AircraftImageRecord] = []
+    source_annotation_audits = {
+        source: audit_coco_source_annotations(root, labels) for source, root in sources.items()
+    }
     source_counts: dict[str, int] = {}
     annotation_record_counts: dict[str, int] = {}
     discovered_paths: list[str] = []
@@ -561,9 +816,11 @@ def prepare_aircraft_data(config: Mapping[str, Any]) -> dict[str, Any]:
         near_hamming=int(dataset_config.get("near_duplicate_hamming", 6)),
         derivative_patterns=dataset_config.get("derivative_stem_patterns", ()),
     )
-    invalid_paths = {item["path"] for item in duplicate.invalid_images}
-    exact_removed = {pair[1] for pair in duplicate.exact_pairs}
     records_by_path = {str(Path(record.path).resolve()): record for record in all_records}
+    invalid_paths = {item["path"] for item in duplicate.invalid_images}
+    exact_removed, exact_label_conflicts = _select_exact_duplicate_removals(
+        records_by_path, duplicate.hashes
+    )
     records = [
         record
         for path, record in records_by_path.items()
@@ -639,10 +896,15 @@ def prepare_aircraft_data(config: Mapping[str, Any]) -> dict[str, Any]:
     return {
         "source_counts": source_counts,
         "annotation_record_counts": annotation_record_counts,
+        "source_annotation_audits": source_annotation_audits,
         "images_discovered": len(discovered_paths),
         "valid_images": len(records),
         "invalid_images": duplicate.invalid_images,
         "exact_duplicates": len(duplicate.exact_pairs),
+        "exact_duplicate_label_conflicts": exact_label_conflicts,
+        "exact_duplicate_resolution": (
+            "Kept one copy with the most specific/rich annotation set; aircraftsurface1 wins exact ties."
+        ),
         "near_duplicates": len(duplicate.near_pairs),
         "derivative_pairs": len(duplicate.derivative_pairs),
         "removed_duplicates": len(exact_removed),
@@ -904,7 +1166,10 @@ def find_bladesynth_normal_paths(root: str | Path) -> list[str]:
         if not _is_dataset_image(path):
             continue
         parent_names = {canonical_label(part) for part in path.parts}
-        if parent_names & normal_names and not parent_names & rejected_names:
+        is_annotation_artifact = bool(parent_names & rejected_names) or any(
+            "mask" in name or "ground truth" in name for name in parent_names
+        )
+        if parent_names & normal_names and not is_annotation_artifact:
             paths.append(str(path.resolve()))
     if not paths:
         raise DatasetConfigurationError(
@@ -913,23 +1178,98 @@ def find_bladesynth_normal_paths(root: str | Path) -> list[str]:
     return sorted(paths)
 
 
+def audit_bladesynth(
+    root: str | Path,
+    expected_images_per_class: int = 2500,
+) -> dict[str, Any]:
+    """Validate the official five-class BladeSynth archive before it is used."""
+    root = Path(root)
+    normal_paths = find_bladesynth_normal_paths(root)
+    expected_classes = {"normal", "dent", "nick", "scratch", "corrosion"}
+    rejected_names = {"mask", "masks", "label", "labels", "ground truth", "groundtruth"}
+    class_paths: dict[str, list[Path]] = defaultdict(list)
+    mask_files = 0
+    unclassified = []
+    for path in root.rglob("*"):
+        if not _is_dataset_image(path):
+            continue
+        parent_names = {canonical_label(part) for part in path.parts}
+        if parent_names & rejected_names or any(
+            "mask" in name or "ground truth" in name for name in parent_names
+        ):
+            mask_files += 1
+            continue
+        matches = sorted(parent_names & expected_classes)
+        if len(matches) == 1:
+            class_paths[matches[0]].append(path)
+        else:
+            unclassified.append(str(path.resolve()))
+    counts = {name: len(class_paths[name]) for name in sorted(expected_classes)}
+    unexpected_counts = {
+        name: count for name, count in counts.items() if count != expected_images_per_class
+    }
+    if unexpected_counts:
+        raise DatasetConfigurationError(
+            "BladeSynth class counts do not match the official archive "
+            f"({expected_images_per_class} images per class): {unexpected_counts}."
+        )
+    corrupt = []
+    dimensions_by_class: dict[str, Counter[str]] = defaultdict(Counter)
+    for class_name, paths in class_paths.items():
+        for path in paths:
+            try:
+                image = load_image(path)
+            except ImageValidationError as exc:
+                corrupt.append({"path": str(path), "error": str(exc)})
+                continue
+            dimensions_by_class[class_name][f"{image.width}x{image.height}"] += 1
+    if corrupt:
+        raise DatasetConfigurationError(
+            f"BladeSynth contains {len(corrupt)} corrupt class images; first: {corrupt[:3]}"
+        )
+    return {
+        "image_class_counts": counts,
+        "normal_images": len(normal_paths),
+        "mask_files": mask_files,
+        "unclassified_image_files": len(unclassified),
+        "image_dimensions_by_class": {
+            name: dict(sorted(dimensions_by_class[name].items()))
+            for name in sorted(expected_classes)
+        },
+        "synthetic_anomaly_classes_used_as_normal": False,
+        "used_for_real_test_metrics": False,
+        "role": "synthetic auxiliary experiment only",
+    }
+
+
 def split_aebad_training_paths(root: str | Path, validation_fraction: float, seed: int) -> tuple[list[str], list[str]]:
     root = _resolve_aebad_s_root(Path(root))
     good_root = root / "train" / "good"
     if not good_root.is_dir():
         raise DatasetConfigurationError(f"AeBAD-S normal training directory is missing: {good_root}")
-    paths = sorted(
+    discovered = sorted(
         str(path.resolve())
         for path in good_root.rglob("*")
         if _is_dataset_image(path)
     )
+    unique_by_hash: dict[str, str] = {}
+    for path in discovered:
+        unique_by_hash.setdefault(sha256_file(path), path)
+    paths = sorted(unique_by_hash.values())
     if len(paths) < 2:
         raise DatasetConfigurationError("AeBAD-S needs at least two normal training images for train/validation separation.")
     if not 0 < validation_fraction < 1:
         raise ValueError("validation_fraction must be between zero and one.")
-    random.Random(seed).shuffle(paths)
-    validation_count = max(1, min(len(paths) - 1, round(len(paths) * validation_fraction)))
-    return sorted(paths[validation_count:]), sorted(paths[:validation_count])
+    by_name: dict[str, list[str]] = defaultdict(list)
+    for path in paths:
+        by_name[Path(path).name.lower()].append(path)
+    splits = _grouped_split(
+        paths,
+        list(by_name.values()),
+        {"train": 1.0 - validation_fraction, "validation": validation_fraction, "test": 0.0},
+        seed,
+    )
+    return splits["train"], splits["validation"]
 
 
 def _resolve_aebad_s_root(root: Path) -> Path:
@@ -970,13 +1310,11 @@ def prepare_datasets(config: Mapping[str, Any], report_path: str | Path | None =
     video_paths = sample_aebad_v_training_paths(
         config["paths"]["aebad"], int(config["engine"]["aebad_v_frame_stride"])
     )
+    bladesynth_report = audit_bladesynth(
+        config["paths"]["bladesynth"],
+        int(config["engine"].get("bladesynth_expected_images_per_class", 2500)),
+    )
     bladesynth_paths = find_bladesynth_normal_paths(config["paths"]["bladesynth"])
-    minimum_bladesynth_normals = int(config["engine"].get("bladesynth_min_normal_images", 1))
-    if len(bladesynth_paths) < minimum_bladesynth_normals:
-        raise DatasetConfigurationError(
-            f"BladeSynth Normal class has only {len(bladesynth_paths)} images; expected at least "
-            f"{minimum_bladesynth_normals}. The archive may be incomplete or incorrectly extracted."
-        )
     imdd_report = audit_imdd_aircraft_subset(
         config["paths"]["imdd_aircraft_images"], config["paths"]["imdd_aircraft_csv"]
     )
@@ -994,6 +1332,7 @@ def prepare_datasets(config: Mapping[str, Any], report_path: str | Path | None =
                 "aebad_v_sampled_normal_frames": len(video_paths),
                 "aebad_v_stride": int(config["engine"]["aebad_v_frame_stride"]),
                 "bladesynth_normal_images": len(bladesynth_paths),
+                "bladesynth_audit": bladesynth_report,
                 "synthetic_anomalies_used_as_normal": False,
                 "used_for_threshold_calibration": False,
                 "used_for_final_test": False,

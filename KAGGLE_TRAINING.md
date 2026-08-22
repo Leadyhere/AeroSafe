@@ -93,11 +93,16 @@ Scientific data use is intentionally staged:
   ASDD + aircraftsurface1 detector split.
 - IMDD's 4,281 images have image-level CSV labels but no bounding boxes, so they are audited and excluded
   from object-detector training. Creating full-image fake boxes would damage localization training.
-- MMR first uses sampled real AeBAD-V normal frames plus BladeSynth's `Normal` class, then fine-tunes on
-  real AeBAD-S normal images.
-- MMR thresholds are calibrated only with held-out real AeBAD-S normal images. BladeSynth anomaly images
-  are never treated as normal and never mixed into the reported real AeBAD-S test metrics.
+- The primary MMR is trained only on real AeBAD-S normals. A second, separately checkpointed experiment
+  pretrains on sampled real AeBAD-V normals plus BladeSynth's `Normal` class, then fine-tunes on AeBAD-S.
+- Both MMR variants calibrate thresholds only with held-out real AeBAD-S normals. BladeSynth anomaly
+  images are never treated as normal, and experimental metrics are written under
+  `reports/experiments/bladesynth_mmr/` rather than mixed into the four-model comparison.
 - PatchCore remains a clean real-data baseline fitted only on the same AeBAD-S normal split.
+
+To promote IMDD into detector training later, annotate true defect boxes for a reviewed subset in
+Roboflow or CVAT, export it as COCO, and add that export as a new boxed source. Keep the original CSV-only
+copy unchanged for image-level external checks. Do not auto-convert each full image into one box.
 
 ## 6. Smoke-test, train, and evaluate
 
@@ -109,6 +114,10 @@ Run each stage in a separate notebook cell:
 !python scripts/kaggle_train_all.py --stage evaluate --config config.yaml
 ```
 
+The smoke and full stages run the four primary models and then the separately named BladeSynth MMR
+experiment. This means MMR is trained twice by design and requires additional Kaggle GPU time; the two
+checkpoints and metric directories never overwrite each other.
+
 Smoke artifacts are isolated under `checkpoints/smoke/` and `reports/smoke/`; they never replace full
 weights or metrics. If CUDA runs out of memory, reduce the relevant `batch_size` in `config.yaml`.
 
@@ -117,7 +126,8 @@ If a Kaggle session stops, resume the affected gradient-trained model with its s
 ```python
 !python scripts/train_aircraft.py --mode full --config config.yaml --resume checkpoints/aircraft_training_state.pt
 !python scripts/train_faster_rcnn.py --mode full --config config.yaml --resume checkpoints/faster_rcnn_training_state.pt
-!python scripts/train_engine.py --mode full --config config.yaml --resume checkpoints/engine_training_state.pt
+!python scripts/train_engine.py --mode full --variant real --config config.yaml --resume checkpoints/engine_training_state.pt
+!python scripts/train_engine.py --mode full --variant bladesynth --config config.yaml --resume checkpoints/engine_bladesynth_training_state.pt
 ```
 
 PatchCore fitting is deterministic and should be rerun instead of resumed.

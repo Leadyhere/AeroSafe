@@ -12,7 +12,11 @@ from src.data import (
     AircraftImageRecord,
     DatasetConfigurationError,
     _grouped_split,
+    _select_exact_duplicate_removals,
+    audit_bladesynth,
+    audit_coco_source_annotations,
     audit_imdd_aircraft_subset,
+    detection_sampling_weights,
     find_bladesynth_normal_paths,
     load_agdd_source,
     load_aircraft_source,
@@ -98,6 +102,23 @@ def test_coco_conversion_preserves_traceability(tmp_path: Path) -> None:
     assert json.loads(destination.read_text())["categories"][0]["name"] == "crack"
 
 
+def test_detection_sampling_weights_upweight_rare_classes_without_overweighting_negatives(
+    tmp_path: Path,
+) -> None:
+    payload = {
+        "images": [{"id": index} for index in (1, 2, 3, 4)],
+        "annotations": [
+            {"image_id": 1, "category_id": 1},
+            {"image_id": 2, "category_id": 1},
+            {"image_id": 3, "category_id": 2},
+        ],
+    }
+    path = tmp_path / "balanced.json"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    weights = detection_sampling_weights(path, max_weight=1.25)
+    assert weights == [1.0, 1.0, 1.25, 1.0]
+
+
 def test_load_pascal_voc_and_clip_box(tmp_path: Path) -> None:
     image_path = tmp_path / "images" / "panel.jpg"
     save_image(image_path, size=(100, 80))
@@ -131,6 +152,9 @@ def test_all_roboflow_coco_split_files_are_loaded(tmp_path: Path) -> None:
         )
     records = load_aircraft_source(tmp_path, "Roboflow", LABELS)
     assert len(records) == 3
+    audit = audit_coco_source_annotations(tmp_path, LABELS)
+    assert audit["totals"]["images"] == 3
+    assert audit["totals"]["missing_image_files"] == 0
 
 
 def test_numpy_nan_image_is_rejected() -> None:
@@ -149,17 +173,60 @@ def test_duplicate_group_never_crosses_splits() -> None:
     assert set(memberships) == set(paths)
 
 
+def test_exact_duplicate_prefers_specific_annotation_over_composite_label() -> None:
+    broad = AircraftImageRecord(
+        "asdd.jpg",
+        100,
+        100,
+        "ASDD",
+        [AircraftAnnotation([0, 0, 20, 20], "surface_damage", "composite", "ASDD")],
+    )
+    specific = AircraftImageRecord(
+        "aircraftsurface.jpg",
+        100,
+        100,
+        "aircraftsurface1",
+        [AircraftAnnotation([0, 0, 20, 20], "dent", "Dent", "aircraftsurface1")],
+    )
+    records = {broad.path: broad, specific.path: specific}
+    hashes = {
+        broad.path: {"sha256": "same"},
+        specific.path: {"sha256": "same"},
+    }
+    removed, conflicts = _select_exact_duplicate_removals(records, hashes)
+    assert removed == {broad.path}
+    assert conflicts == 1
+
+
 def test_official_aebad_parent_or_direct_root_is_accepted(tmp_path: Path) -> None:
     direct = tmp_path / "AeBAD_S"
     for relative in ["train/good/same", "train/good/view", "test/good/same", "ground_truth"]:
         (direct / relative).mkdir(parents=True, exist_ok=True)
-    save_image(direct / "train/good/same/one.png")
-    save_image(direct / "train/good/view/two.png")
+    save_image(direct / "train/good/same/one.png", color=(10, 20, 30))
+    save_image(direct / "train/good/view/two.png", color=(40, 50, 60))
     train, validation = split_aebad_training_paths(tmp_path, 0.5, seed=7)
     assert len(train) == len(validation) == 1
     train_direct, validation_direct = split_aebad_training_paths(direct, 0.5, seed=7)
     assert train == train_direct
     assert validation == validation_direct
+
+
+def test_aebad_split_removes_exact_copies_and_groups_repeated_names(tmp_path: Path) -> None:
+    root = tmp_path / "AeBAD_S"
+    (root / "test").mkdir(parents=True)
+    save_image(root / "train/good/background/shared.png", color=(10, 20, 30))
+    save_image(root / "train/good/view/shared.png", color=(30, 40, 50))
+    save_image(root / "train/good/view/exact_copy.png", color=(10, 20, 30))
+    save_image(root / "train/good/illumination/unique.png", color=(60, 70, 80))
+    train, validation = split_aebad_training_paths(root, 0.5, seed=3)
+    combined = train + validation
+    assert len(combined) == 3
+    shared_splits = {
+        "train" if path in train else "validation"
+        for path in combined
+        if Path(path).name == "shared.png"
+    }
+    assert len(shared_splits) == 1
 
 
 def test_agdd_rectangular_boxes_and_unmapped_spot(tmp_path: Path) -> None:
@@ -182,7 +249,7 @@ def test_imdd_audit_rejects_missing_images_and_records_no_boxes(tmp_path: Path) 
     save_image(images / "crack" / "one.jpg")
     csv_path = tmp_path / "labels.csv"
     csv_path.write_text(
-        "Image Name,label,Categories,Description\none.jpg,0,aircraft crack,visible crack\n",
+        "Image Name,label,Categories,Description\none.jpg,0,crack,visible crack\n",
         encoding="utf-8",
     )
     report = audit_imdd_aircraft_subset(images, csv_path)
@@ -211,6 +278,18 @@ def test_aebad_v_sampling_is_per_video_and_bladesynth_uses_only_normal(tmp_path:
     save_image(tmp_path / "BladeSynth/Normal/images/._resource_fork.png")
     save_image(tmp_path / "BladeSynth/Scratch/images/bad.png")
     save_image(tmp_path / "BladeSynth/Normal/masks/not_input.png")
+    save_image(tmp_path / "BladeSynth/Dent/images/dent.png")
+    save_image(tmp_path / "BladeSynth/Nick/images/nick.png")
+    save_image(tmp_path / "BladeSynth/Corrosion/images/corrosion.png")
     normal = find_bladesynth_normal_paths(tmp_path / "BladeSynth")
     assert len(normal) == 1
     assert normal[0].endswith("normal.png")
+    audit = audit_bladesynth(tmp_path / "BladeSynth", expected_images_per_class=1)
+    assert audit["image_class_counts"] == {
+        "corrosion": 1,
+        "dent": 1,
+        "nick": 1,
+        "normal": 1,
+        "scratch": 1,
+    }
+    assert audit["mask_files"] == 1
