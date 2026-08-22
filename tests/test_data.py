@@ -12,9 +12,13 @@ from src.data import (
     AircraftImageRecord,
     DatasetConfigurationError,
     _grouped_split,
+    audit_imdd_aircraft_subset,
+    find_bladesynth_normal_paths,
+    load_agdd_source,
     load_aircraft_source,
     normalize_label,
     records_to_coco,
+    sample_aebad_v_training_paths,
     split_aebad_training_paths,
 )
 from src.preprocessing import (
@@ -111,6 +115,24 @@ def test_load_pascal_voc_and_clip_box(tmp_path: Path) -> None:
     assert records[0].annotations[0].bbox == [0.0, 10.0, 100.0, 60.0]
 
 
+def test_all_roboflow_coco_split_files_are_loaded(tmp_path: Path) -> None:
+    for offset, split in enumerate(("train", "valid", "test"), start=1):
+        image_path = tmp_path / split / f"image_{offset}.jpg"
+        save_image(image_path, size=(100, 80))
+        payload = {
+            "images": [{"id": offset, "file_name": image_path.name, "width": 100, "height": 80}],
+            "annotations": [
+                {"id": offset, "image_id": offset, "category_id": 1, "bbox": [1, 2, 10, 20]}
+            ],
+            "categories": [{"id": 1, "name": "crack"}],
+        }
+        (image_path.parent / "_annotations.coco.json").write_text(
+            json.dumps(payload), encoding="utf-8"
+        )
+    records = load_aircraft_source(tmp_path, "Roboflow", LABELS)
+    assert len(records) == 3
+
+
 def test_numpy_nan_image_is_rejected() -> None:
     with pytest.raises(ImageValidationError, match="NaN"):
         load_image(np.full((10, 10), np.nan))
@@ -138,3 +160,57 @@ def test_official_aebad_parent_or_direct_root_is_accepted(tmp_path: Path) -> Non
     train_direct, validation_direct = split_aebad_training_paths(direct, 0.5, seed=7)
     assert train == train_direct
     assert validation == validation_direct
+
+
+def test_agdd_rectangular_boxes_and_unmapped_spot(tmp_path: Path) -> None:
+    data = tmp_path / "nested" / "data"
+    for split in ("train", "val"):
+        for modality in ("image", "images"):
+            save_image(data / modality / split / f"{split}.png", size=(100, 80))
+        label = data / "labels_rect" / split / f"{split}.txt"
+        label.parent.mkdir(parents=True, exist_ok=True)
+        label.write_text("2 0.5 0.5 0.4 0.5\n3 0.2 0.2 0.1 0.1\n", encoding="utf-8")
+    records = load_agdd_source(tmp_path, LABELS)
+    assert len(records["train"]) == len(records["validation"]) == 2
+    assert records["train"][0].annotations[0].normalized_class == "crack"
+    assert records["train"][0].annotations[0].bbox == [30.0, 20.0, 40.0, 40.0]
+    assert len(records["train"][0].annotations) == 1
+
+
+def test_imdd_audit_rejects_missing_images_and_records_no_boxes(tmp_path: Path) -> None:
+    images = tmp_path / "imdd"
+    save_image(images / "crack" / "one.jpg")
+    csv_path = tmp_path / "labels.csv"
+    csv_path.write_text(
+        "Image Name,label,Categories,Description\none.jpg,0,aircraft crack,visible crack\n",
+        encoding="utf-8",
+    )
+    report = audit_imdd_aircraft_subset(images, csv_path)
+    assert report["images"] == 1
+    assert report["has_localization_boxes"] is False
+    assert report["used_for_detector_training"] is False
+    csv_path.write_text(
+        "Image Name,label,Categories,Description\nmissing.jpg,0,aircraft crack,visible crack\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(DatasetConfigurationError, match="missing or ambiguous"):
+        audit_imdd_aircraft_subset(images, csv_path)
+
+
+def test_aebad_v_sampling_is_per_video_and_bladesynth_uses_only_normal(tmp_path: Path) -> None:
+    for relative in ["AeBAD_S/train", "AeBAD_S/test", "AeBAD_V/train/good/video1", "AeBAD_V/train/good/video2"]:
+        (tmp_path / relative).mkdir(parents=True, exist_ok=True)
+    for video in ("video1", "video2"):
+        for index in range(5):
+            save_image(tmp_path / "AeBAD_V/train/good" / video / f"{index:03}.png")
+    save_image(tmp_path / "AeBAD_V/train/good/video1/._resource_fork.png")
+    save_image(tmp_path / "AeBAD_V/train/good/video1/__MACOSX/metadata.png")
+    sampled = sample_aebad_v_training_paths(tmp_path, stride=3)
+    assert len(sampled) == 4
+    save_image(tmp_path / "BladeSynth/Normal/images/normal.png")
+    save_image(tmp_path / "BladeSynth/Normal/images/._resource_fork.png")
+    save_image(tmp_path / "BladeSynth/Scratch/images/bad.png")
+    save_image(tmp_path / "BladeSynth/Normal/masks/not_input.png")
+    normal = find_bladesynth_normal_paths(tmp_path / "BladeSynth")
+    assert len(normal) == 1
+    assert normal[0].endswith("normal.png")

@@ -1,8 +1,11 @@
 paths:
-  asdd: data/asdd
-  aircraftsurface: data/aircraftsurface1
-  aebad: data/AeBAD/AeBAD_S
-  bladesynth: data/bladesynth
+  asdd: datasets/Dataset2.v2-defect-classification.coco
+  aircraftsurface: datasets/aircraftsurface1.v1i.coco
+  agdd: datasets/AGDD-main
+  imdd_aircraft_images: datasets/0to4_aircraft_skin4000pics
+  imdd_aircraft_csv: datasets/0-4aircraft4000.csv
+  aebad: datasets/AeBAD/AeBAD
+  bladesynth: datasets/Dataset_bladesynth
   external_iisc: data/iisc_aircraft_skin
   processed: data/processed
   checkpoints: checkpoints
@@ -12,11 +15,12 @@ paths:
 
 aircraft_labels:
   crack: [crack, cracks]
-  dent: [dent, dents]
+  dent: [dent, dents, contusion]
   scratch: [scratch, scratches]
   paint_damage: [paint-off, paint off, paint peel, paint peeling, paint_damage, paint damage]
-  missing_fastener: [missing-head, missing head, missing fastener, missing-fastener, missing rivet, missing-rivet]
+  missing_fastener: [missing-head, missing head, missing fastener, missing-fastener, missing rivet, missing-rivet, missing bolt]
   corrosion: [corrosion, corroded]
+  surface_damage: [dent scratch or paint falling, defect]
 
 dataset:
   split: {train: 0.70, validation: 0.15, test: 0.15}
@@ -36,6 +40,7 @@ aircraft:
   gradient_accumulation: 2
   max_grad_norm: 0.1
   image_size: 800
+  auxiliary_pretrain_epochs: 3
 
 engine:
   model: mmr
@@ -53,6 +58,9 @@ engine:
   normal_threshold_quantile: 0.995
   anomaly_threshold: null
   pixel_threshold: null
+  auxiliary_pretrain_epochs: 5
+  aebad_v_frame_stride: 10
+  bladesynth_min_normal_images: 2500
 
 baselines:
   faster_rcnn:

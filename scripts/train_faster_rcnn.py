@@ -41,8 +41,11 @@ def main() -> int:
     processed = Path(config["paths"]["processed"]) / "aircraft"
     train_file = processed / "train.json"
     validation_file = processed / "validation.json"
+    auxiliary_file = Path(config["paths"]["processed"]) / "aircraft_auxiliary/agdd_train.json"
     if not train_file.is_file() or not validation_file.is_file():
         parser.error("Prepared aircraft splits are missing. Run scripts/prepare_data.py first.")
+    if not auxiliary_file.is_file():
+        parser.error("Prepared AGDD auxiliary split is missing. Run scripts/prepare_data.py first.")
     categories = sorted(json.loads(train_file.read_text(encoding="utf-8"))["categories"], key=lambda x: x["id"])
     model = FasterRCNNBaseline(
         [item["name"] for item in categories],
@@ -50,10 +53,19 @@ def main() -> int:
         confidence_threshold=float(config["aircraft"]["confidence_threshold"]),
     )
     dataset = FasterRCNNDataset(train_file, train=True)
+    auxiliary_dataset = FasterRCNNDataset(auxiliary_file, train=True)
     if args.mode == "smoke":
         dataset = Subset(dataset, range(min(2, len(dataset))))
-    loader = DataLoader(
+        auxiliary_dataset = Subset(auxiliary_dataset, range(min(2, len(auxiliary_dataset))))
+    train_loader = DataLoader(
         dataset,
+        batch_size=1 if args.mode == "smoke" else int(baseline["batch_size"]),
+        shuffle=True,
+        num_workers=0 if args.mode == "smoke" else int(config["training"]["num_workers"]),
+        collate_fn=collate_faster_rcnn,
+    )
+    auxiliary_loader = DataLoader(
+        auxiliary_dataset,
         batch_size=1 if args.mode == "smoke" else int(baseline["batch_size"]),
         shuffle=True,
         num_workers=0 if args.mode == "smoke" else int(config["training"]["num_workers"]),
@@ -66,8 +78,12 @@ def main() -> int:
         momentum=float(baseline["momentum"]),
         weight_decay=float(baseline["weight_decay"]),
     )
-    epochs = 1 if args.mode == "smoke" else int(baseline["epochs"])
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, max(1, epochs))
+    main_epochs = 1 if args.mode == "smoke" else int(baseline["epochs"])
+    auxiliary_epochs = (
+        1 if args.mode == "smoke" else int(config["aircraft"]["auxiliary_pretrain_epochs"])
+    )
+    total_epochs = auxiliary_epochs + main_epochs
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, max(1, total_epochs))
     amp_enabled = bool(config["training"]["mixed_precision"]) and model.device.type == "cuda"
     scaler = torch.amp.GradScaler("cuda", enabled=amp_enabled)
     output_root = Path(config["paths"]["checkpoints"])
@@ -90,7 +106,9 @@ def main() -> int:
         start_epoch = int(state["epoch"]) + 1
         best_map = float(state.get("best_map", -1.0))
 
-    for epoch in range(start_epoch, epochs):
+    for epoch in range(start_epoch, total_epochs):
+        phase = "agdd_pretraining" if epoch < auxiliary_epochs else "aircraft_skin_finetuning"
+        loader = auxiliary_loader if phase == "agdd_pretraining" else train_loader
         model.model.train()
         for images, targets in loader:
             images = [image.to(model.device) for image in images]
@@ -109,20 +127,27 @@ def main() -> int:
             if args.mode == "smoke":
                 break
         scheduler.step()
-        predictions, latencies = collect_predictions(
-            model, validation_file, limit=2 if args.mode == "smoke" else None
-        )
-        metrics = evaluate_aircraft_predictions(
-            validation_file, predictions, report_dir, latencies_ms=latencies
-        )
+        metrics = None
+        if phase == "aircraft_skin_finetuning":
+            predictions, latencies = collect_predictions(
+                model, validation_file, limit=2 if args.mode == "smoke" else None
+            )
+            metrics = evaluate_aircraft_predictions(
+                validation_file, predictions, report_dir, latencies_ms=latencies
+            )
         metadata = {
             "version": f"epoch-{epoch + 1}",
             "epoch": epoch + 1,
             "validation_metrics": metrics,
             "config": config,
             "comparison_split": "same prepared split as Deformable DETR",
+            "training_phases": {
+                "agdd_epochs": auxiliary_epochs,
+                "aircraft_skin_epochs": main_epochs,
+                "imdd_detector_usage": False,
+            },
         }
-        if metrics["map_50_95"] >= best_map:
+        if metrics is not None and metrics["map_50_95"] >= best_map:
             best_map = float(metrics["map_50_95"])
             model.save(checkpoint_path, metadata)
         state_path.parent.mkdir(parents=True, exist_ok=True)

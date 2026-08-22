@@ -15,7 +15,13 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from src import load_config
-from src.data import AeBADDataset, split_aebad_training_paths
+from src.data import (
+    AeBADDataset,
+    NormalImageDataset,
+    find_bladesynth_normal_paths,
+    sample_aebad_v_training_paths,
+    split_aebad_training_paths,
+)
 from src.engine_model import MaskedMultiScaleReconstruction
 from src.evaluation import evaluate_engine_predictions
 
@@ -47,8 +53,17 @@ def main() -> int:
     train_paths, validation_paths = split_aebad_training_paths(
         config["paths"]["aebad"], float(engine["validation_fraction"]), seed
     )
+    video_paths = sample_aebad_v_training_paths(
+        config["paths"]["aebad"], int(engine["aebad_v_frame_stride"])
+    )
+    synthetic_normal_paths = find_bladesynth_normal_paths(config["paths"]["bladesynth"])
+    if len(synthetic_normal_paths) < int(engine.get("bladesynth_min_normal_images", 1)):
+        parser.error("BladeSynth Normal class is incomplete. Run dataset preparation for details.")
+    auxiliary_paths = [*video_paths, *synthetic_normal_paths]
+    random.Random(seed).shuffle(auxiliary_paths)
     if args.mode == "smoke":
         train_paths, validation_paths = train_paths[:2], validation_paths[:2]
+        auxiliary_paths = auxiliary_paths[:2]
     train_transform = v2.Compose(
         [
             v2.RandomResizedCrop(
@@ -67,6 +82,9 @@ def main() -> int:
     validation_dataset = AeBADDataset(
         config["paths"]["aebad"], "validation", image_size=int(engine["image_size"]), paths=validation_paths
     )
+    auxiliary_dataset = NormalImageDataset(
+        auxiliary_paths, image_size=int(engine["image_size"]), transform=train_transform
+    )
     train_loader = DataLoader(
         train_dataset,
         batch_size=1 if args.mode == "smoke" else int(engine["batch_size"]),
@@ -74,6 +92,12 @@ def main() -> int:
         num_workers=0 if args.mode == "smoke" else int(config["training"]["num_workers"]),
     )
     validation_loader = DataLoader(validation_dataset, batch_size=int(engine["batch_size"]), shuffle=False)
+    auxiliary_loader = DataLoader(
+        auxiliary_dataset,
+        batch_size=1 if args.mode == "smoke" else int(engine["batch_size"]),
+        shuffle=True,
+        num_workers=0 if args.mode == "smoke" else int(config["training"]["num_workers"]),
+    )
     model = MaskedMultiScaleReconstruction(
         image_size=int(engine["image_size"]),
         teacher_backbone=engine["teacher_backbone"],
@@ -85,8 +109,10 @@ def main() -> int:
         lr=float(engine["learning_rate"]),
         weight_decay=float(engine["weight_decay"]),
     )
-    epochs = 1 if args.mode == "smoke" else int(engine["epochs"])
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, max(1, epochs))
+    main_epochs = 1 if args.mode == "smoke" else int(engine["epochs"])
+    auxiliary_epochs = 1 if args.mode == "smoke" else int(engine["auxiliary_pretrain_epochs"])
+    total_epochs = auxiliary_epochs + main_epochs
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, max(1, total_epochs))
     amp_enabled = bool(config["training"]["mixed_precision"]) and model.device.type == "cuda"
     scaler = torch.amp.GradScaler("cuda", enabled=amp_enabled)
     checkpoint_root = Path(config["paths"]["checkpoints"])
@@ -102,9 +128,11 @@ def main() -> int:
         if "scaler" in checkpoint:
             scaler.load_state_dict(checkpoint["scaler"])
         start_epoch = int(checkpoint["epoch"]) + 1
-    for epoch in range(start_epoch, epochs):
+    for epoch in range(start_epoch, total_epochs):
+        phase = "auxiliary_pretraining" if epoch < auxiliary_epochs else "aebad_s_finetuning"
+        active_loader = auxiliary_loader if phase == "auxiliary_pretraining" else train_loader
         model.train()
-        for batch in train_loader:
+        for batch in active_loader:
             images = batch["image"].to(model.device)
             optimizer.zero_grad(set_to_none=True)
             with torch.amp.autocast("cuda", enabled=amp_enabled):
@@ -142,8 +170,8 @@ def main() -> int:
     anomaly_threshold = float(np.quantile(validation_scores, quantile))
     pixel_threshold = float(np.quantile(np.concatenate(validation_pixels), quantile))
     metadata = {
-        "version": f"epoch-{epochs}",
-        "epoch": epochs,
+        "version": f"epoch-{total_epochs}",
+        "epoch": total_epochs,
         "anomaly_threshold": anomaly_threshold,
         "pixel_threshold": pixel_threshold,
         "threshold_source": "held-out AeBAD-S training normals",
@@ -155,6 +183,13 @@ def main() -> int:
             "score_std": float(np.std(validation_scores)),
             "score_min": float(np.min(validation_scores)),
             "score_max": float(np.max(validation_scores)),
+        },
+        "training_phases": {
+            "auxiliary_epochs": auxiliary_epochs,
+            "aebad_s_epochs": main_epochs,
+            "aebad_v_sampled_normals": len(video_paths),
+            "bladesynth_normals": len(synthetic_normal_paths),
+            "synthetic_anomalies_used_as_normal": False,
         },
         "dataset_report": (
             json.loads((Path(config["paths"]["reports"]) / "dataset_report.json").read_text(encoding="utf-8"))
@@ -174,7 +209,7 @@ def main() -> int:
             "optimizer": optimizer.state_dict(),
             "scheduler": scheduler.state_dict(),
             "scaler": scaler.state_dict(),
-            "epoch": epochs - 1,
+            "epoch": total_epochs - 1,
             "metadata": metadata,
         },
         training_state,
@@ -205,7 +240,8 @@ def main() -> int:
             pixel_threshold=pixel_threshold,
         )
     print(
-        f"Completed {args.mode} MMR training; thresholds calibrated from held-out normal validation data."
+        f"Completed {args.mode} MMR two-stage training; thresholds calibrated from held-out "
+        "AeBAD-S normal validation data."
     )
     return 0
 

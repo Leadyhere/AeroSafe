@@ -57,22 +57,25 @@ Data is deliberately excluded from Git. Configure local or Kaggle paths in `conf
 
 | Dataset | Role | Leakage rule |
 |---|---|---|
-| [ASDD](https://universe.roboflow.com/project-5lf3h/dataset2-69an0) | Main aircraft detector data | Clean, normalize, then group before splitting |
-| [aircraftsurface1](https://universe.roboflow.com/yolo11aircraft/aircraftsurface1/dataset/1) | Supplementary aircraft data | Exact/near/derivative controls are mandatory because the published version includes augmented outputs |
-| [AeBAD-S](https://github.com/zhangzilongc/MMR) | Primary MMR training and final engine evaluation | Only normal training images fit MMR; official test data is never used for training or threshold selection |
-| BladeSynth | Optional, explicitly synthetic experiment | Never silently merge synthetic and real metrics |
+| [ASDD](https://universe.roboflow.com/project-5lf3h/dataset2-69an0) | Main aircraft detector fine-tuning | Clean, normalize, then group before splitting |
+| [aircraftsurface1](https://universe.roboflow.com/yolo11aircraft/aircraftsurface1/dataset/1) | Supplementary aircraft detector fine-tuning | Control exact, near, and augmented derivatives before splitting |
+| [AGDD](https://github.com/core128/AGDD) | Aircraft detector auxiliary pretraining | Map rectangular boxes for contusion, scratches, and crack; ignore unmapped `spot` |
+| IMDD aircraft subset | Image-level aircraft data audit | Its CSV has no boxes, so it is never passed to either object detector |
+| [AeBAD-S and AeBAD-V](https://github.com/zhangzilongc/MMR) | Real engine training, calibration, and evaluation | Use normal training images only; official AeBAD-S test is never used for fitting or threshold selection |
+| BladeSynth | Synthetic normal auxiliary pretraining | Use only the explicit Normal class; never mix synthetic results into real AeBAD-S metrics |
 | [IISc aircraft skin defects](https://universe.roboflow.com/ddiisc/aircraft_skin_defects) | Optional external generalization test | Frozen final aircraft model only; never tune on it |
 
 Expected minimum layout:
 
 ```text
-data/
-├── asdd/                     # COCO, Pascal VOC, YOLO, or LabelMe annotations
-├── aircraftsurface1/         # COCO, Pascal VOC, YOLO, or LabelMe annotations
-└── AeBAD/AeBAD_S/
-    ├── train/good/...
-    ├── test/...
-    └── ground_truth/...
+datasets/
+|-- Dataset2.v2-defect-classification.coco/  # ASDD COCO export
+|-- aircraftsurface1.v1i.coco/               # aircraftsurface1 COCO export
+|-- AGDD-main/                               # contains data/labels_rect
+|-- 0to4_aircraft_skin4000pics/              # IMDD images (audit only)
+|-- 0-4aircraft4000.csv                      # IMDD image-level labels
+|-- AeBAD/AeBAD/                             # contains AeBAD_S and AeBAD_V
+`-- Dataset_bladesynth/                      # extracted archive; Normal class required
 ```
 
 Missing or unrecognized data produces a direct setup error. The code never substitutes a convenient
@@ -83,16 +86,22 @@ unrelated dataset and never infers detector labels from directory names.
 `scripts/prepare_data.py` performs these steps before training:
 
 1. Decode and validate supported images.
-2. Parse COCO, Pascal VOC, YOLO, or LabelMe aircraft annotations.
+2. Parse all Roboflow COCO split files plus supported Pascal VOC, YOLO, or LabelMe annotations.
 3. Normalize aliases while retaining original source/class fields.
-4. Compute SHA-256 exact hashes plus pHash and dHash near-duplicate hashes.
-5. Conservatively group common augmented filename derivatives.
-6. Remove byte-exact copies and keep near/derivative groups in one split.
-7. Enable `corrosion` only when the configured reliable-example minimum is met.
-8. Export train/validation/test COCO files and `reports/dataset_report.json` from observed data.
+4. Validate AGDD rectangular boxes and create a separate auxiliary-pretraining split.
+5. Audit IMDD CSV/image agreement without inventing localization boxes.
+6. Exclude macOS archive metadata such as `._*.png` and `__MACOSX` from image discovery.
+7. Compute SHA-256 exact hashes plus pHash and dHash near-duplicate hashes.
+8. Conservatively group common augmented filename derivatives.
+9. Remove byte-exact copies and keep near/derivative groups in one split.
+10. Validate AeBAD-S masks, sample AeBAD-V normal frames per video, and accept only BladeSynth Normal images.
+11. Export train/validation/test COCO files and `reports/dataset_report.json` from observed data.
 
-ASDD and aircraftsurface1 are re-split as a combined cleaned corpus. AeBAD-S keeps its official test
-boundary; a deterministic subset of normal training images is held out only for threshold calibration.
+ASDD and aircraftsurface1 are re-split as a combined cleaned corpus after AGDD auxiliary pretraining.
+AeBAD-S keeps its official test boundary; a deterministic subset of real normal training images is held
+out only for threshold calibration. MMR's auxiliary phase uses sampled normal AeBAD-V frames and only the
+explicit BladeSynth Normal class before real AeBAD-S fine-tuning. PatchCore stays AeBAD-S-only so it
+remains a clean real-data baseline.
 
 ## Deformable DETR
 
@@ -143,8 +152,9 @@ expected and preferable to fake readiness.
 ## Training on Kaggle
 
 Use a GPU notebook, enable Internet for the first pretrained-weight download (or attach the weights as a
-Kaggle Dataset), attach ASDD, aircraftsurface1, and AeBAD-S as read-only inputs, and copy this repository to
-`/kaggle/working/aeroinspect`.
+Kaggle Dataset), attach all six downloaded dataset packages as read-only inputs, and clone this repository
+to `/kaggle/working/aeroinspect`. BladeSynth must be fully downloaded, extracted, and uploaded; a
+`.crdownload` file is not usable data.
 
 Update only the `paths` block in `config.yaml`, for example:
 
@@ -152,7 +162,11 @@ Update only the `paths` block in `config.yaml`, for example:
 paths:
   asdd: /kaggle/input/asdd
   aircraftsurface: /kaggle/input/aircraftsurface1
-  aebad: /kaggle/input/aebad/AeBAD_S
+  agdd: /kaggle/input/agdd/AGDD-main
+  imdd_aircraft_images: /kaggle/input/imdd/0to4_aircraft_skin4000pics
+  imdd_aircraft_csv: /kaggle/input/imdd/0-4aircraft4000.csv
+  aebad: /kaggle/input/aebad/AeBAD/AeBAD
+  bladesynth: /kaggle/input/bladesynth/Dataset_bladesynth
   processed: /kaggle/working/aeroinspect/data/processed
   checkpoints: /kaggle/working/aeroinspect/checkpoints
   reports: /kaggle/working/aeroinspect/reports

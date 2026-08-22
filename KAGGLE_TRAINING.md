@@ -1,19 +1,42 @@
 # Kaggle training runbook
 
-This runbook trains or fits all four declared models on controlled, identical splits:
+This runbook prepares the downloaded datasets, smoke-tests all four models, trains them, and performs
+final evaluation. Keep every dataset separate; the preparation code combines only compatible labels and
+preserves source metadata.
 
-1. Deformable DETR and Faster R-CNN use the same cleaned ASDD + aircraftsurface1 split.
-2. MMR and PatchCore use the same normal AeBAD-S training and threshold-calibration split.
-3. All four are evaluated on held-out data. IISc remains external-test-only; BladeSynth is excluded
-   from this initial real-data comparison.
+## 1. Finish and extract BladeSynth
 
-## 1. Create the notebook
+`Unconfirmed 93855.crdownload` is an incomplete Chrome download. It cannot be uploaded to Kaggle or used
+for training. Wait until Chrome finishes and renames it to `Dataset_bladesynth.rar`, then extract the RAR.
+The configured extracted directory is `Dataset_bladesynth/`.
 
-Create a Kaggle notebook, select a GPU accelerator, enable Internet for pretrained-weight downloads,
-and attach ASDD, aircraftsurface1, and AeBAD-S as inputs. Dataset licenses and access remain the user's
-responsibility.
+Do not rename the `.crdownload` file manually. If Chrome reports that the download failed, resume it in
+Chrome or restart the download.
 
-Clone the repository:
+## 2. Create Kaggle datasets
+
+Upload the following directories/files as private Kaggle datasets. Large datasets may be split into more
+than one Kaggle input; the code only needs the final paths.
+
+| Local item | Purpose |
+|---|---|
+| `Dataset2.v2-defect-classification.coco/` | ASDD detector fine-tuning |
+| `aircraftsurface1.v1i.coco/` | Aircraft detector fine-tuning |
+| `AGDD-main/` | AGDD detector auxiliary pretraining |
+| `0to4_aircraft_skin4000pics/` and `0-4aircraft4000.csv` | IMDD integrity audit only; no boxes exist |
+| `AeBAD/AeBAD/` | AeBAD-S training/test plus AeBAD-V normal auxiliary frames |
+| extracted `Dataset_bladesynth/` | BladeSynth Normal-only MMR auxiliary pretraining |
+
+For each Kaggle dataset: open **Datasets → New Dataset**, upload the corresponding folder (or a ZIP), set
+visibility to **Private**, and create it. Kaggle automatically extracts ZIP files, but RAR extraction is
+not dependable; upload the already-extracted BladeSynth directory.
+
+## 3. Create the notebook
+
+Create a Kaggle notebook, choose a GPU accelerator, enable Internet for pretrained-weight downloads, and
+attach every private Kaggle dataset from the notebook's **Add Input** panel.
+
+Clone and install AeroInspect:
 
 ```python
 !git clone https://github.com/Leadyhere/AeroSafe.git /kaggle/working/aeroinspect
@@ -21,23 +44,26 @@ Clone the repository:
 !pip install -q -r requirements.txt
 ```
 
-Inspect the exact input directory names:
+Inspect the exact mounted names before editing the configuration:
 
 ```python
-!find /kaggle/input -maxdepth 4 -type d | head -100
+!find /kaggle/input -maxdepth 5 -type d | head -200
 ```
 
-## 2. Set paths
+## 4. Set the exact paths
 
-Edit only the `paths` section of `config.yaml`. Kaggle input mounts are read-only; processed data,
-checkpoints, and reports must use `/kaggle/working`.
+Edit only the `paths` block in `config.yaml`. Replace every `YOUR-...-SLUG` with the name shown under
+`/kaggle/input`. The directory may have one additional wrapper level depending on how it was uploaded.
 
 ```yaml
 paths:
-  asdd: /kaggle/input/YOUR-ASDD-SLUG
-  aircraftsurface: /kaggle/input/YOUR-AIRCRAFTSURFACE1-SLUG
-  aebad: /kaggle/input/YOUR-AEBAD-SLUG/AeBAD_S
-  bladesynth: /kaggle/input/not-used
+  asdd: /kaggle/input/YOUR-ASDD-SLUG/Dataset2.v2-defect-classification.coco
+  aircraftsurface: /kaggle/input/YOUR-AIRCRAFTSURFACE-SLUG/aircraftsurface1.v1i.coco
+  agdd: /kaggle/input/YOUR-AGDD-SLUG/AGDD-main
+  imdd_aircraft_images: /kaggle/input/YOUR-IMDD-SLUG/0to4_aircraft_skin4000pics
+  imdd_aircraft_csv: /kaggle/input/YOUR-IMDD-SLUG/0-4aircraft4000.csv
+  aebad: /kaggle/input/YOUR-AEBAD-SLUG/AeBAD/AeBAD
+  bladesynth: /kaggle/input/YOUR-BLADESYNTH-SLUG/Dataset_bladesynth
   external_iisc: /kaggle/input/not-used
   processed: /kaggle/working/aeroinspect/data/processed
   checkpoints: /kaggle/working/aeroinspect/checkpoints
@@ -46,32 +72,64 @@ paths:
   inspections: /kaggle/working/aeroinspect/data/inspections
 ```
 
-## 3. Prepare, smoke-test, train, and evaluate
+The AeBAD adapter accepts either the parent that contains `AeBAD_S/` and `AeBAD_V/` or the `AeBAD_S/`
+directory itself, but the parent is required here because MMR also uses normal AeBAD-V training frames.
 
-Run stages separately so failures are easy to diagnose:
+## 5. Prepare and verify
+
+Run preparation first:
 
 ```python
 !python scripts/kaggle_train_all.py --stage prepare --config config.yaml
+```
+
+This command must finish successfully and create `reports/dataset_report.json`. It checks annotation
+formats, image decoding, missing masks, class mappings, exact/near duplicates, and minimum BladeSynth
+Normal-image count. Do not continue if it raises an error; correct the named path or incomplete dataset.
+
+Scientific data use is intentionally staged:
+
+- Deformable DETR and Faster R-CNN pretrain on mapped AGDD boxes, then fine-tune on the cleaned combined
+  ASDD + aircraftsurface1 detector split.
+- IMDD's 4,281 images have image-level CSV labels but no bounding boxes, so they are audited and excluded
+  from object-detector training. Creating full-image fake boxes would damage localization training.
+- MMR first uses sampled real AeBAD-V normal frames plus BladeSynth's `Normal` class, then fine-tunes on
+  real AeBAD-S normal images.
+- MMR thresholds are calibrated only with held-out real AeBAD-S normal images. BladeSynth anomaly images
+  are never treated as normal and never mixed into the reported real AeBAD-S test metrics.
+- PatchCore remains a clean real-data baseline fitted only on the same AeBAD-S normal split.
+
+## 6. Smoke-test, train, and evaluate
+
+Run each stage in a separate notebook cell:
+
+```python
 !python scripts/kaggle_train_all.py --stage smoke --config config.yaml
 !python scripts/kaggle_train_all.py --stage full --config config.yaml
 !python scripts/kaggle_train_all.py --stage evaluate --config config.yaml
 ```
 
-Smoke outputs are isolated under `checkpoints/smoke` and `reports/smoke`; they never replace full
-checkpoints or final metrics. If a session stops during gradient-based training, resume the affected
-model with its own `--resume` option. PatchCore fitting is deterministic and should simply be rerun.
+Smoke artifacts are isolated under `checkpoints/smoke/` and `reports/smoke/`; they never replace full
+weights or metrics. If CUDA runs out of memory, reduce the relevant `batch_size` in `config.yaml`.
 
-If CUDA runs out of memory, reduce the relevant `batch_size` in `config.yaml`. Do not change dataset
-splits independently between a main model and its baseline.
+If a Kaggle session stops, resume the affected gradient-trained model with its saved state:
 
-## 4. Preserve outputs
+```python
+!python scripts/train_aircraft.py --mode full --config config.yaml --resume checkpoints/aircraft_training_state.pt
+!python scripts/train_faster_rcnn.py --mode full --config config.yaml --resume checkpoints/faster_rcnn_training_state.pt
+!python scripts/train_engine.py --mode full --config config.yaml --resume checkpoints/engine_training_state.pt
+```
 
-Before ending the Kaggle session, use **Save Version** with outputs enabled or download:
+PatchCore fitting is deterministic and should be rerun instead of resumed.
+
+## 7. Preserve outputs
+
+Before the Kaggle session ends, choose **Save Version** with outputs enabled or download:
 
 ```text
 checkpoints/
 reports/
 ```
 
-`reports/model_comparison.json` contains the final four-model comparison. Real metrics appear only after
-the final evaluation; the repository intentionally ships with no fabricated scores or model weights.
+`reports/model_comparison.json` contains the final four-model comparison. The repository ships with no
+fabricated metrics or trained weights.

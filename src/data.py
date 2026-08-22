@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import csv
 import json
 import random
 import re
@@ -25,6 +26,16 @@ from .preprocessing import (
 
 class DatasetConfigurationError(RuntimeError):
     """Raised when a required real dataset is absent or structurally unsupported."""
+
+
+def _is_dataset_image(path: Path) -> bool:
+    """Return true only for real image files, excluding archive metadata artifacts."""
+    return (
+        path.is_file()
+        and path.suffix.lower() in SUPPORTED_IMAGE_EXTENSIONS
+        and not path.name.startswith("._")
+        and not any(part.lower() == "__macosx" for part in path.parts)
+    )
 
 
 @dataclass
@@ -87,7 +98,7 @@ def _find_image(root: Path, file_name: str, index: Mapping[str, list[Path]]) -> 
 def _image_index(root: Path) -> dict[str, list[Path]]:
     index: dict[str, list[Path]] = defaultdict(list)
     for path in root.rglob("*"):
-        if path.is_file() and path.suffix.lower() in SUPPORTED_IMAGE_EXTENSIONS:
+        if _is_dataset_image(path):
             index[path.name.lower()].append(path)
     return index
 
@@ -97,6 +108,7 @@ def _records_from_coco(
     annotation_path: Path,
     source: str,
     labels: Mapping[str, Sequence[str]],
+    image_index: Mapping[str, list[Path]] | None = None,
 ) -> list[AircraftImageRecord]:
     try:
         payload = json.loads(annotation_path.read_text(encoding="utf-8"))
@@ -108,7 +120,7 @@ def _records_from_coco(
     grouped: dict[int, list[dict[str, Any]]] = defaultdict(list)
     for annotation in payload["annotations"]:
         grouped[int(annotation["image_id"])].append(annotation)
-    index = _image_index(root)
+    index = image_index or _image_index(root)
     records: list[AircraftImageRecord] = []
     for item in payload["images"]:
         image_path = _find_image(annotation_path.parent, str(item["file_name"]), index)
@@ -296,10 +308,16 @@ def load_aircraft_source(
             f"{source} dataset directory is missing: {root}. Download the real dataset and update config.yaml."
         )
     json_candidates = sorted(root.rglob("*.json"))
+    coco_records: list[AircraftImageRecord] = []
+    image_index = _image_index(root) if json_candidates else {}
     for candidate in json_candidates:
-        records = _records_from_coco(root, candidate, source, label_config)
-        if records:
-            return records
+        coco_records.extend(
+            _records_from_coco(root, candidate, source, label_config, image_index=image_index)
+        )
+    if coco_records:
+        # Roboflow exports one COCO file per train/valid/test directory. Load all of them.
+        unique = {str(Path(record.path).resolve()): record for record in coco_records}
+        return [unique[path] for path in sorted(unique)]
     records = _records_from_voc(root, source, label_config)
     if records:
         return records
@@ -313,6 +331,133 @@ def load_aircraft_source(
         f"No supported COCO, Pascal VOC, YOLO, or LabelMe annotations were found in {root}. "
         "AeroInspect will not infer labels from folder names."
     )
+
+
+def load_agdd_source(
+    root: str | Path,
+    label_config: Mapping[str, Sequence[str]],
+) -> dict[str, list[AircraftImageRecord]]:
+    """Load AGDD's paired illumination images with rectangular YOLO boxes."""
+    root = Path(root)
+    if not root.is_dir():
+        raise DatasetConfigurationError(f"AGDD dataset directory is missing: {root}")
+    label_roots = [path for path in root.rglob("labels_rect") if path.is_dir()]
+    if len(label_roots) != 1:
+        raise DatasetConfigurationError(
+            f"Expected exactly one AGDD labels_rect directory under {root}, found {len(label_roots)}."
+        )
+    data_root = label_roots[0].parent
+    class_names = ["contusion", "scratches", "crack", "spot"]
+    result: dict[str, list[AircraftImageRecord]] = {"train": [], "validation": []}
+    for source_split, output_split in (("train", "train"), ("val", "validation")):
+        label_dir = data_root / "labels_rect" / source_split
+        if not label_dir.is_dir():
+            raise DatasetConfigurationError(f"AGDD label split is missing: {label_dir}")
+        for modality in ("image", "images"):
+            image_dir = data_root / modality / source_split
+            if not image_dir.is_dir():
+                raise DatasetConfigurationError(f"AGDD image split is missing: {image_dir}")
+            for image_path in sorted(
+                path for path in image_dir.iterdir()
+                if _is_dataset_image(path)
+            ):
+                label_path = label_dir / f"{image_path.stem}.txt"
+                if not label_path.is_file():
+                    raise DatasetConfigurationError(f"AGDD rectangular label is missing: {label_path}")
+                try:
+                    image = load_image(image_path)
+                except ImageValidationError as exc:
+                    raise DatasetConfigurationError(f"Invalid AGDD image {image_path}: {exc}") from exc
+                annotations: list[AircraftAnnotation] = []
+                for line_number, line in enumerate(
+                    label_path.read_text(encoding="utf-8").splitlines(), start=1
+                ):
+                    fields = line.split()
+                    if len(fields) != 5:
+                        raise DatasetConfigurationError(
+                            f"Invalid AGDD rectangular label at {label_path}:{line_number}"
+                        )
+                    try:
+                        class_id = int(fields[0])
+                        cx, cy, box_width, box_height = map(float, fields[1:])
+                    except ValueError as exc:
+                        raise DatasetConfigurationError(
+                            f"Invalid AGDD numeric label at {label_path}:{line_number}"
+                        ) from exc
+                    if not 0 <= class_id < len(class_names):
+                        raise DatasetConfigurationError(
+                            f"Unknown AGDD class id {class_id} at {label_path}:{line_number}"
+                        )
+                    original = class_names[class_id]
+                    normalized = normalize_label(original, label_config)
+                    bbox = _valid_bbox(
+                        [
+                            (cx - box_width / 2) * image.width,
+                            (cy - box_height / 2) * image.height,
+                            box_width * image.width,
+                            box_height * image.height,
+                        ],
+                        image.width,
+                        image.height,
+                    )
+                    # AGDD "spot" has no defensible mapping to the aircraft-skin taxonomy.
+                    if normalized and bbox:
+                        annotations.append(
+                            AircraftAnnotation(bbox, normalized, original, "AGDD")
+                        )
+                result[output_split].append(
+                    AircraftImageRecord(
+                        str(image_path.resolve()), image.width, image.height, "AGDD", annotations
+                    )
+                )
+    return result
+
+
+def audit_imdd_aircraft_subset(
+    image_root: str | Path, csv_path: str | Path
+) -> dict[str, Any]:
+    """Validate IMDD aircraft image-level labels without inventing detector boxes."""
+    image_root, csv_path = Path(image_root), Path(csv_path)
+    if not image_root.is_dir():
+        raise DatasetConfigurationError(f"IMDD aircraft image directory is missing: {image_root}")
+    if not csv_path.is_file():
+        raise DatasetConfigurationError(f"IMDD aircraft CSV is missing: {csv_path}")
+    with csv_path.open("r", encoding="utf-8-sig", newline="") as handle:
+        rows = list(csv.DictReader(handle))
+    required = {"Image Name", "label", "Categories", "Description"}
+    if not rows or not required.issubset(rows[0]):
+        raise DatasetConfigurationError(
+            f"IMDD CSV must contain {sorted(required)} and at least one data row: {csv_path}"
+        )
+    images = [
+        path for path in image_root.rglob("*")
+        if _is_dataset_image(path)
+    ]
+    by_name: dict[str, list[Path]] = defaultdict(list)
+    for path in images:
+        by_name[path.name.lower()].append(path)
+    csv_names = [str(row["Image Name"]).strip().lower() for row in rows]
+    missing = sorted({name for name in csv_names if len(by_name.get(name, [])) != 1})
+    unreferenced = sorted(path.name for path in images if path.name.lower() not in set(csv_names))
+    if missing:
+        raise DatasetConfigurationError(
+            f"IMDD CSV has {len(missing)} missing or ambiguous image references; first: {missing[:5]}"
+        )
+    class_counts = Counter(
+        canonical_label(str(row["Categories"]).split(",")[-1]) for row in rows
+    )
+    return {
+        "images": len(images),
+        "csv_rows": len(rows),
+        "unreferenced_images": len(unreferenced),
+        "class_distribution": dict(sorted(class_counts.items())),
+        "annotation_level": "image_classification_and_text",
+        "has_localization_boxes": False,
+        "used_for_detector_training": False,
+        "exclusion_reason": (
+            "The CSV has image-level labels/descriptions but no bounding boxes; detector boxes are never invented."
+        ),
+    }
 
 
 def _grouped_split(
@@ -402,7 +547,7 @@ def prepare_aircraft_data(config: Mapping[str, Any]) -> dict[str, Any]:
         records = load_aircraft_source(root, source, labels)
         source_images = sorted(
             path for path in root.rglob("*")
-            if path.is_file() and path.suffix.lower() in SUPPORTED_IMAGE_EXTENSIONS
+            if _is_dataset_image(path)
         )
         source_counts[source] = len(source_images)
         annotation_record_counts[source] = len(records)
@@ -458,6 +603,36 @@ def prepare_aircraft_data(config: Mapping[str, Any]) -> dict[str, Any]:
         )
         coco_outputs[split] = str(output_path)
 
+    agdd_records = load_agdd_source(paths["agdd"], labels)
+    agdd_paths = [record.path for split_records in agdd_records.values() for record in split_records]
+    agdd_duplicates = analyze_duplicates(
+        agdd_paths,
+        near_hamming=int(dataset_config.get("near_duplicate_hamming", 6)),
+        derivative_patterns=dataset_config.get("derivative_stem_patterns", ()),
+    )
+    agdd_invalid = {item["path"] for item in agdd_duplicates.invalid_images}
+    agdd_exact_removed = {pair[1] for pair in agdd_duplicates.exact_pairs}
+    main_exact_hashes = {value["sha256"] for value in duplicate.hashes.values()}
+    cross_source_removed = {
+        path
+        for path, hashes in agdd_duplicates.hashes.items()
+        if hashes["sha256"] in main_exact_hashes
+    }
+    auxiliary_outputs: dict[str, str] = {}
+    auxiliary_counts: dict[str, int] = {}
+    auxiliary_root = Path(paths["processed"]) / "aircraft_auxiliary"
+    for split in ("train", "validation"):
+        usable = [
+            record for record in agdd_records[split]
+            if record.path not in agdd_invalid
+            and record.path not in agdd_exact_removed
+            and record.path not in cross_source_removed
+        ]
+        output_path = auxiliary_root / f"agdd_{split}.json"
+        records_to_coco(usable, categories, output_path)
+        auxiliary_outputs[split] = str(output_path)
+        auxiliary_counts[split] = len(usable)
+
     final_counts = Counter(
         annotation.normalized_class for record in records for annotation in record.annotations
     )
@@ -475,6 +650,14 @@ def prepare_aircraft_data(config: Mapping[str, Any]) -> dict[str, Any]:
         "corrosion_enabled": corrosion_enabled,
         "splits": {name: len(items) for name, items in splits.items()},
         "coco_annotations": coco_outputs,
+        "auxiliary_pretraining": {
+            "source": "AGDD",
+            "images": auxiliary_counts,
+            "coco_annotations": auxiliary_outputs,
+            "ignored_unmapped_class": "spot",
+            "cross_source_exact_duplicates_removed": len(cross_source_removed),
+            "used_for_final_test": False,
+        },
         "integrity": {"duplicate_groups_kept_within_one_split": True, "external_iisc_used": False},
     }
 
@@ -563,7 +746,7 @@ class AeBADDataset:
         if not base.is_dir():
             raise DatasetConfigurationError(f"AeBAD-S split directory is missing: {base}")
         discovered = sorted(
-            path for path in base.rglob("*") if path.is_file() and path.suffix.lower() in SUPPORTED_IMAGE_EXTENSIONS
+            path for path in base.rglob("*") if _is_dataset_image(path)
         )
         if paths is not None:
             allowed = {str(Path(path).resolve()) for path in paths}
@@ -640,7 +823,7 @@ class BladeSynthDataset:
         if not self.root.is_dir():
             raise DatasetConfigurationError(f"Optional BladeSynth directory is missing: {self.root}")
         self.paths = sorted(
-            path for path in self.root.rglob("*") if path.is_file() and path.suffix.lower() in SUPPORTED_IMAGE_EXTENSIONS
+            path for path in self.root.rglob("*") if _is_dataset_image(path)
         )
         if not self.paths:
             raise DatasetConfigurationError(f"No images found in BladeSynth directory: {self.root}")
@@ -654,6 +837,82 @@ class BladeSynthDataset:
         return {"image": self.transform(image) if self.transform else image, "source": "BladeSynth", "synthetic": True}
 
 
+class NormalImageDataset:
+    """Normalized image-only dataset for auxiliary normality pretraining."""
+
+    def __init__(self, paths: Sequence[str | Path], image_size: int = 224, transform: Any = None):
+        if not paths:
+            raise DatasetConfigurationError("Normal-image dataset received no image paths.")
+        self.paths = [Path(path) for path in paths]
+        self.image_size = int(image_size)
+        self.transform = transform
+
+    def __len__(self) -> int:
+        return len(self.paths)
+
+    def __getitem__(self, index: int) -> dict[str, Any]:
+        import torch
+        from torchvision.transforms import v2
+
+        image = load_image(self.paths[index])
+        default_transform = v2.Compose(
+            [
+                v2.Resize((self.image_size, self.image_size), antialias=True),
+                v2.ToImage(),
+                v2.ToDtype(torch.float32, scale=True),
+                v2.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
+            ]
+        )
+        tensor = self.transform(image) if self.transform else default_transform(image)
+        return {"image": tensor, "image_path": str(self.paths[index])}
+
+
+def sample_aebad_v_training_paths(root: str | Path, stride: int = 10) -> list[str]:
+    """Sample only official normal AeBAD-V training frames, independently per video."""
+    if stride < 1:
+        raise ValueError("AeBAD-V frame stride must be at least one.")
+    aebad_s = _resolve_aebad_s_root(Path(root))
+    video_root = aebad_s.parent / "AeBAD_V" / "train" / "good"
+    if not video_root.is_dir():
+        raise DatasetConfigurationError(f"AeBAD-V normal training directory is missing: {video_root}")
+    selected: list[str] = []
+    video_dirs = sorted(path for path in video_root.iterdir() if path.is_dir())
+    if not video_dirs:
+        raise DatasetConfigurationError(f"No AeBAD-V training videos found under {video_root}")
+    for video_dir in video_dirs:
+        frames = sorted(
+            path for path in video_dir.rglob("*")
+            if _is_dataset_image(path)
+        )
+        selected.extend(str(path.resolve()) for path in frames[::stride])
+    if not selected:
+        raise DatasetConfigurationError("AeBAD-V sampling produced no normal training frames.")
+    return selected
+
+
+def find_bladesynth_normal_paths(root: str | Path) -> list[str]:
+    """Find BladeSynth's Normal class without accepting masks as input images."""
+    root = Path(root)
+    if not root.is_dir():
+        raise DatasetConfigurationError(
+            f"BladeSynth directory is missing: {root}. The .crdownload file is not a completed dataset."
+        )
+    normal_names = {"normal", "good", "healthy", "defect free", "defectfree"}
+    rejected_names = {"mask", "masks", "label", "labels", "ground truth", "groundtruth"}
+    paths = []
+    for path in root.rglob("*"):
+        if not _is_dataset_image(path):
+            continue
+        parent_names = {canonical_label(part) for part in path.parts}
+        if parent_names & normal_names and not parent_names & rejected_names:
+            paths.append(str(path.resolve()))
+    if not paths:
+        raise DatasetConfigurationError(
+            f"No BladeSynth Normal images were found under {root}. Extract the completed archive first."
+        )
+    return sorted(paths)
+
+
 def split_aebad_training_paths(root: str | Path, validation_fraction: float, seed: int) -> tuple[list[str], list[str]]:
     root = _resolve_aebad_s_root(Path(root))
     good_root = root / "train" / "good"
@@ -662,7 +921,7 @@ def split_aebad_training_paths(root: str | Path, validation_fraction: float, see
     paths = sorted(
         str(path.resolve())
         for path in good_root.rglob("*")
-        if path.is_file() and path.suffix.lower() in SUPPORTED_IMAGE_EXTENSIONS
+        if _is_dataset_image(path)
     )
     if len(paths) < 2:
         raise DatasetConfigurationError("AeBAD-S needs at least two normal training images for train/validation separation.")
@@ -688,7 +947,8 @@ def _resolve_aebad_s_root(root: Path) -> Path:
 
 def prepare_datasets(config: Mapping[str, Any], report_path: str | Path | None = None) -> dict[str, Any]:
     """Prepare configured real datasets and write a truthful, generated report."""
-    aircraft_report = prepare_aircraft_data(config)
+    # Run inexpensive completeness checks before the slow aircraft duplicate
+    # analysis so an unfinished archive fails quickly and clearly.
     train_paths, validation_paths = split_aebad_training_paths(
         config["paths"]["aebad"],
         float(config["engine"]["validation_fraction"]),
@@ -697,14 +957,47 @@ def prepare_datasets(config: Mapping[str, Any], report_path: str | Path | None =
     aebad_test = AeBADDataset(
         config["paths"]["aebad"], "test", image_size=int(config["engine"]["image_size"])
     )
+    missing_masks = []
+    for image_path in aebad_test.paths:
+        parts = {part.lower() for part in image_path.parts}
+        if not ({"good", "normal"} & parts) and aebad_test._mask_path(image_path) is None:
+            missing_masks.append(str(image_path))
+    if missing_masks:
+        raise DatasetConfigurationError(
+            f"AeBAD-S has {len(missing_masks)} anomalous test images without masks; first: "
+            f"{missing_masks[:3]}"
+        )
+    video_paths = sample_aebad_v_training_paths(
+        config["paths"]["aebad"], int(config["engine"]["aebad_v_frame_stride"])
+    )
+    bladesynth_paths = find_bladesynth_normal_paths(config["paths"]["bladesynth"])
+    minimum_bladesynth_normals = int(config["engine"].get("bladesynth_min_normal_images", 1))
+    if len(bladesynth_paths) < minimum_bladesynth_normals:
+        raise DatasetConfigurationError(
+            f"BladeSynth Normal class has only {len(bladesynth_paths)} images; expected at least "
+            f"{minimum_bladesynth_normals}. The archive may be incomplete or incorrectly extracted."
+        )
+    imdd_report = audit_imdd_aircraft_subset(
+        config["paths"]["imdd_aircraft_images"], config["paths"]["imdd_aircraft_csv"]
+    )
+    aircraft_report = prepare_aircraft_data(config)
     report = {
         "aircraft": aircraft_report,
+        "aircraft_image_level_auxiliary": {"source": "IMDD aircraft subset", **imdd_report},
         "engine": {
             "source": "AeBAD-S",
             "train_normal": len(train_paths),
             "validation_normal": len(validation_paths),
             "test": len(aebad_test),
             "threshold_selected_on_final_test": False,
+            "auxiliary_pretraining": {
+                "aebad_v_sampled_normal_frames": len(video_paths),
+                "aebad_v_stride": int(config["engine"]["aebad_v_frame_stride"]),
+                "bladesynth_normal_images": len(bladesynth_paths),
+                "synthetic_anomalies_used_as_normal": False,
+                "used_for_threshold_calibration": False,
+                "used_for_final_test": False,
+            },
         },
     }
     destination = Path(report_path or Path(config["paths"]["reports"]) / "dataset_report.json")
