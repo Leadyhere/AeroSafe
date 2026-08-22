@@ -1,0 +1,185 @@
+"""Fine-tune Deformable DETR on prepared ASDD + cleaned aircraftsurface1 data."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import random
+import sys
+from functools import partial
+from pathlib import Path
+
+import numpy as np
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from src import load_config
+from src.aircraft_model import AircraftDetector, collate_detection_batch
+from src.data import AircraftDetectionDataset
+from src.evaluation import evaluate_aircraft_predictions
+from src.preprocessing import build_aircraft_augmentation, load_image
+
+
+def seed_everything(seed: int) -> None:
+    import torch
+
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
+def collect_predictions(detector, annotation_file: Path, limit: int | None = None):
+    payload = json.loads(annotation_file.read_text(encoding="utf-8"))
+    category_ids = [item["id"] for item in sorted(payload["categories"], key=lambda item: item["id"])]
+    predictions, latencies = [], []
+    for item in payload["images"][:limit]:
+        # COCO AP needs the ranked prediction set; the deployment threshold is applied only in the app.
+        detections = detector.predict(load_image(item["file_name"]), threshold=0.001)
+        latencies.append(detector.last_inference_time_ms)
+        for detection in detections:
+            x1, y1, x2, y2 = detection["bbox"]
+            predictions.append(
+                {
+                    "image_id": item["id"],
+                    "category_id": category_ids[detector.label2id[detection["class"]]],
+                    "bbox": [x1, y1, x2 - x1, y2 - y1],
+                    "score": detection["confidence"],
+                }
+            )
+    return predictions, latencies
+
+
+def main() -> int:
+    import torch
+    from torch.utils.data import DataLoader, Subset
+
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--mode", choices=("smoke", "full"), required=True)
+    parser.add_argument("--config", default="config.yaml")
+    parser.add_argument("--resume", default=None)
+    args = parser.parse_args()
+    config = load_config(args.config)
+    seed = int(config["training"]["seed"])
+    seed_everything(seed)
+    processed = Path(config["paths"]["processed"]) / "aircraft"
+    train_file, validation_file = processed / "train.json", processed / "validation.json"
+    if not train_file.is_file() or not validation_file.is_file():
+        parser.error("Prepared COCO files are missing. Run scripts/prepare_data.py first.")
+    categories = sorted(json.loads(train_file.read_text())["categories"], key=lambda item: item["id"])
+    labels = [item["name"] for item in categories]
+    detector = AircraftDetector(
+        labels,
+        pretrained_model=config["aircraft"]["pretrained_model"],
+        confidence_threshold=float(config["aircraft"]["confidence_threshold"]),
+    )
+    train_dataset = AircraftDetectionDataset(
+        train_file,
+        detector.processor,
+        transform=build_aircraft_augmentation(int(config["aircraft"]["image_size"])),
+    )
+    if args.mode == "smoke":
+        train_dataset = Subset(train_dataset, range(min(2, len(train_dataset))))
+    loader = DataLoader(
+        train_dataset,
+        batch_size=1 if args.mode == "smoke" else int(config["aircraft"]["batch_size"]),
+        shuffle=True,
+        num_workers=0 if args.mode == "smoke" else int(config["training"]["num_workers"]),
+        collate_fn=partial(collate_detection_batch, processor=detector.processor),
+    )
+    backbone, remaining = [], []
+    for name, parameter in detector.model.named_parameters():
+        (backbone if "backbone" in name else remaining).append(parameter)
+    optimizer = torch.optim.AdamW(
+        [
+            {"params": remaining, "lr": float(config["aircraft"]["learning_rate"])},
+            {"params": backbone, "lr": float(config["aircraft"]["backbone_learning_rate"])},
+        ],
+        weight_decay=float(config["aircraft"]["weight_decay"]),
+    )
+    epochs = 1 if args.mode == "smoke" else int(config["aircraft"]["epochs"])
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(1, epochs))
+    amp_enabled = bool(config["training"]["mixed_precision"]) and detector.device.type == "cuda"
+    scaler = torch.amp.GradScaler("cuda", enabled=amp_enabled)
+    start_epoch = 0
+    best_map = -1.0
+    if args.resume:
+        state = torch.load(args.resume, map_location=detector.device, weights_only=False)
+        detector.model.load_state_dict(state["model"])
+        optimizer.load_state_dict(state["optimizer"])
+        scheduler.load_state_dict(state["scheduler"])
+        if "scaler" in state:
+            scaler.load_state_dict(state["scaler"])
+        start_epoch = int(state["epoch"]) + 1
+        best_map = float(state.get("best_map", -1.0))
+    accumulation = 1 if args.mode == "smoke" else int(config["aircraft"]["gradient_accumulation"])
+    checkpoint_root = Path(config["paths"]["checkpoints"])
+    reports_root = Path(config["paths"]["reports"])
+    checkpoint_destination = (
+        checkpoint_root / "smoke" / "aircraft_best"
+        if args.mode == "smoke"
+        else Path(config["aircraft"]["checkpoint"])
+    )
+    training_state = checkpoint_root / (
+        "smoke/aircraft_training_state.pt" if args.mode == "smoke" else "aircraft_training_state.pt"
+    )
+    reports = reports_root / "smoke/deformable_detr" if args.mode == "smoke" else reports_root
+    dataset_report_path = reports / "dataset_report.json"
+    dataset_report = (
+        json.loads(dataset_report_path.read_text(encoding="utf-8"))
+        if dataset_report_path.is_file() else None
+    )
+    for epoch in range(start_epoch, epochs):
+        detector.model.train()
+        optimizer.zero_grad(set_to_none=True)
+        for step, batch in enumerate(loader):
+            pixel_values = batch["pixel_values"].to(detector.device)
+            pixel_mask = batch["pixel_mask"].to(detector.device)
+            targets = [{key: value.to(detector.device) for key, value in label.items()} for label in batch["labels"]]
+            with torch.amp.autocast("cuda", enabled=amp_enabled):
+                outputs = detector.training_forward(pixel_values, pixel_mask, targets)
+                loss = outputs.loss / accumulation
+            scaler.scale(loss).backward()
+            if (step + 1) % accumulation == 0 or step + 1 == len(loader):
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(detector.model.parameters(), float(config["aircraft"]["max_grad_norm"]))
+                scaler.step(optimizer)
+                scaler.update()
+                optimizer.zero_grad(set_to_none=True)
+            if args.mode == "smoke":
+                break
+        scheduler.step()
+        predictions, latencies = collect_predictions(detector, validation_file, 2 if args.mode == "smoke" else None)
+        metrics = evaluate_aircraft_predictions(validation_file, predictions, reports, latencies_ms=latencies)
+        metadata = {
+            "version": f"epoch-{epoch + 1}",
+            "epoch": epoch + 1,
+            "validation_metrics": metrics,
+            "dataset_report": dataset_report,
+            "config": config,
+        }
+        if metrics["map_50_95"] >= best_map:
+            best_map = metrics["map_50_95"]
+            detector.save(checkpoint_destination, metadata)
+        training_state.parent.mkdir(parents=True, exist_ok=True)
+        torch.save(
+            {
+                "model": detector.model.state_dict(),
+                "optimizer": optimizer.state_dict(),
+                "scheduler": scheduler.state_dict(),
+                "scaler": scaler.state_dict(),
+                "epoch": epoch,
+                "best_map": best_map,
+                "metadata": metadata,
+            },
+            training_state,
+        )
+    print(f"Completed {args.mode} Deformable DETR training; best validation mAP={best_map:.6f}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

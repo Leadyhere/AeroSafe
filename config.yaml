@@ -1,0 +1,88 @@
+paths:
+  asdd: data/asdd
+  aircraftsurface: data/aircraftsurface1
+  aebad: data/AeBAD/AeBAD_S
+  bladesynth: data/bladesynth
+  external_iisc: data/iisc_aircraft_skin
+  processed: data/processed
+  checkpoints: checkpoints
+  reports: reports
+  database: data/aeroinspect.sqlite3
+  inspections: data/inspections
+
+aircraft_labels:
+  crack: [crack, cracks]
+  dent: [dent, dents]
+  scratch: [scratch, scratches]
+  paint_damage: [paint-off, paint off, paint peel, paint peeling, paint_damage, paint damage]
+  missing_fastener: [missing-head, missing head, missing fastener, missing-fastener, missing rivet, missing-rivet]
+  corrosion: [corrosion, corroded]
+
+dataset:
+  split: {train: 0.70, validation: 0.15, test: 0.15}
+  near_duplicate_hamming: 6
+  corrosion_min_examples: 30
+  derivative_stem_patterns: ['_aug\d+$', '_copy\d*$', '_flip$', '_rot\d+$', '_resized$', '-aug\d+$']
+
+aircraft:
+  pretrained_model: SenseTime/deformable-detr
+  checkpoint: checkpoints/aircraft_best
+  epochs: 30
+  batch_size: 2
+  learning_rate: 0.00002
+  backbone_learning_rate: 0.000002
+  weight_decay: 0.0001
+  confidence_threshold: 0.50
+  gradient_accumulation: 2
+  max_grad_norm: 0.1
+  image_size: 800
+
+engine:
+  model: mmr
+  checkpoint: checkpoints/engine_best.pt
+  teacher_backbone: wide_resnet50_2.tv2_in1k
+  mae_backbone: vit_base_patch16_224.mae
+  image_size: 224
+  mask_ratio: 0.40
+  inference_masks: 1
+  epochs: 50
+  batch_size: 8
+  learning_rate: 0.0001
+  weight_decay: 0.0001
+  validation_fraction: 0.10
+  normal_threshold_quantile: 0.995
+  anomaly_threshold: null
+  pixel_threshold: null
+
+baselines:
+  faster_rcnn:
+    checkpoint: checkpoints/faster_rcnn_best.pt
+    epochs: 20
+    batch_size: 2
+    learning_rate: 0.005
+    momentum: 0.9
+    weight_decay: 0.0005
+  patchcore:
+    checkpoint: checkpoints/patchcore_best.pt
+    batch_size: 8
+    coreset_fraction: 0.01
+    max_patches: 50000
+    projection_dim: 128
+
+training:
+  seed: 42
+  num_workers: 4
+  mixed_precision: true
+  checkpoint_every: 1
+
+quality:
+  minimum_width: 128
+  minimum_height: 128
+  blur_variance_warning: 35.0
+  dark_mean_warning: 25.0
+  bright_mean_warning: 235.0
+
+app:
+  save_history: true
+  max_upload_mb: 15
+  batch_size: 4
