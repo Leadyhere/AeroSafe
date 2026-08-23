@@ -271,6 +271,8 @@ Engine output:
 - `reports/engine_metrics.json`: image AUROC, pixel AUROC, AUPRO, thresholded Dice/IoU, false alarms,
   missed anomalies, sensitivity/specificity, balanced accuracy, and latency.
 - `reports/engine_domain_metrics.csv`: AUROC, false-alarm rate, and missed-anomaly rate by AeBAD-S domain.
+- `reports/tensorboard/`: live smoke/full training progress, losses, learning rates, validation metrics,
+  threshold calibration, and PatchCore fitting progress for all five training runs.
 
 Undefined metrics (for example AUROC on a one-class subset) are stored as `null`, never coerced into a
 convincing number. The performance page displays “This model has not been evaluated yet” when files are

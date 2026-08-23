@@ -261,7 +261,7 @@ class PatchCoreBaseline:
             selected.append(int(torch.argmax(minimum_distance).item()))
         return embeddings[torch.as_tensor(selected)]
 
-    def fit(self, loader, *, smoke: bool = False) -> None:
+    def fit(self, loader, *, smoke: bool = False, progress_callback: Any = None) -> None:
         import torch
 
         collected = []
@@ -274,6 +274,12 @@ class PatchCoreBaseline:
                 bounded = torch.cat(collected)
                 indices = torch.linspace(0, len(bounded) - 1, self.max_patches).long()
                 collected = [bounded[indices]]
+            if progress_callback is not None:
+                progress_callback(
+                    batch_index + 1,
+                    1 if smoke else len(loader),
+                    sum(len(item) for item in collected),
+                )
             if smoke and batch_index == 0:
                 break
         if not collected:

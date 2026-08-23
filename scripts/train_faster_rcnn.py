@@ -20,6 +20,12 @@ from src.baselines import FasterRCNNBaseline, FasterRCNNDataset, collate_faster_
 from src.data import detection_sampling_weights
 from src.evaluation import evaluate_aircraft_predictions
 from src.preprocessing import build_aircraft_augmentation
+from src.training_monitor import (
+    create_tensorboard_writer,
+    finish_tensorboard,
+    log_epoch_progress,
+    log_numeric_metrics,
+)
 
 
 def main() -> int:
@@ -116,7 +122,7 @@ def main() -> int:
     report_dir = Path(config["paths"]["reports"]) / (
         "smoke/faster_rcnn" if args.mode == "smoke" else "baselines/faster_rcnn"
     )
-    start_epoch, best_map = 0, -1.0
+    start_epoch, best_map, global_step = 0, -1.0, 0
     if args.resume:
         state = torch.load(args.resume, map_location=model.device, weights_only=False)
         model.model.load_state_dict(state["state_dict"])
@@ -125,11 +131,15 @@ def main() -> int:
         scaler.load_state_dict(state.get("scaler", {}))
         start_epoch = int(state["epoch"]) + 1
         best_map = float(state.get("best_map", -1.0))
+        global_step = int(state.get("global_step", 0))
 
+    writer, _ = create_tensorboard_writer(config, "faster_rcnn", args.mode)
     for epoch in range(start_epoch, total_epochs):
         phase = "agdd_pretraining" if epoch < auxiliary_epochs else "aircraft_skin_finetuning"
         loader = auxiliary_loader if phase == "agdd_pretraining" else train_loader
         model.model.train()
+        epoch_loss = 0.0
+        epoch_batches = 0
         for images, targets in loader:
             images = [image.to(model.device) for image in images]
             targets = [{key: value.to(model.device) for key, value in target.items()} for target in targets]
@@ -139,6 +149,18 @@ def main() -> int:
                 loss = sum(losses.values())
             if not torch.isfinite(loss):
                 raise RuntimeError(f"Non-finite Faster R-CNN loss: {float(loss.detach())}")
+            loss_value = float(loss.detach())
+            epoch_loss += loss_value
+            epoch_batches += 1
+            global_step += 1
+            if writer is not None:
+                writer.add_scalar("train/batch_loss", loss_value, global_step)
+                for loss_name, loss_component in losses.items():
+                    writer.add_scalar(
+                        f"train/loss_components/{loss_name}",
+                        float(loss_component.detach()),
+                        global_step,
+                    )
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.model.parameters(), 10.0)
@@ -147,6 +169,16 @@ def main() -> int:
             if args.mode == "smoke":
                 break
         scheduler.step()
+        average_epoch_loss = epoch_loss / max(1, epoch_batches)
+        if writer is not None:
+            writer.add_scalar("train/epoch_loss", average_epoch_loss, epoch + 1)
+        log_epoch_progress(
+            writer,
+            epoch_index=epoch,
+            total_epochs=total_epochs,
+            phase=phase,
+            learning_rate=float(optimizer.param_groups[0]["lr"]),
+        )
         metrics = None
         if phase == "aircraft_skin_finetuning":
             predictions, latencies = collect_predictions(
@@ -159,6 +191,7 @@ def main() -> int:
                 latencies_ms=latencies,
                 calibrate_threshold=True,
             )
+            log_numeric_metrics(writer, "validation", metrics, epoch + 1)
         metadata = {
             "version": f"epoch-{epoch + 1}",
             "epoch": epoch + 1,
@@ -184,9 +217,14 @@ def main() -> int:
                 "scaler": scaler.state_dict(),
                 "epoch": epoch,
                 "best_map": best_map,
+                "global_step": global_step,
             },
             state_path,
         )
+        if writer is not None:
+            writer.add_scalar("validation/best_map_50_95", best_map, epoch + 1)
+            writer.flush()
+    finish_tensorboard(writer)
     print(f"Completed {args.mode} Faster R-CNN training; best validation mAP={best_map:.6f}")
     return 0
 

@@ -20,6 +20,12 @@ from src.aircraft_model import AircraftDetector, collate_detection_batch
 from src.data import AircraftDetectionDataset, detection_sampling_weights
 from src.evaluation import evaluate_aircraft_predictions
 from src.preprocessing import build_aircraft_augmentation, load_image
+from src.training_monitor import (
+    create_tensorboard_writer,
+    finish_tensorboard,
+    log_epoch_progress,
+    log_numeric_metrics,
+)
 
 
 def seed_everything(seed: int) -> None:
@@ -146,6 +152,7 @@ def main() -> int:
     scaler = torch.amp.GradScaler("cuda", enabled=amp_enabled)
     start_epoch = 0
     best_map = -1.0
+    global_step = 0
     if args.resume:
         state = torch.load(args.resume, map_location=detector.device, weights_only=False)
         detector.model.load_state_dict(state["model"])
@@ -155,6 +162,7 @@ def main() -> int:
             scaler.load_state_dict(state["scaler"])
         start_epoch = int(state["epoch"]) + 1
         best_map = float(state.get("best_map", -1.0))
+        global_step = int(state.get("global_step", 0))
     accumulation = 1 if args.mode == "smoke" else int(config["aircraft"]["gradient_accumulation"])
     checkpoint_root = Path(config["paths"]["checkpoints"])
     reports_root = Path(config["paths"]["reports"])
@@ -172,18 +180,34 @@ def main() -> int:
         json.loads(dataset_report_path.read_text(encoding="utf-8"))
         if dataset_report_path.is_file() else None
     )
+    writer, _ = create_tensorboard_writer(config, "deformable_detr", args.mode)
     for epoch in range(start_epoch, total_epochs):
         phase = "agdd_pretraining" if epoch < auxiliary_epochs else "aircraft_skin_finetuning"
         loader = auxiliary_loader if phase == "agdd_pretraining" else train_loader
         detector.model.train()
         optimizer.zero_grad(set_to_none=True)
+        epoch_loss = 0.0
+        epoch_batches = 0
         for step, batch in enumerate(loader):
             pixel_values = batch["pixel_values"].to(detector.device)
             pixel_mask = batch["pixel_mask"].to(detector.device)
             targets = [{key: value.to(detector.device) for key, value in label.items()} for label in batch["labels"]]
             with torch.amp.autocast("cuda", enabled=amp_enabled):
                 outputs = detector.training_forward(pixel_values, pixel_mask, targets)
-                loss = outputs.loss / accumulation
+                raw_loss = outputs.loss
+                loss = raw_loss / accumulation
+            loss_value = float(raw_loss.detach())
+            epoch_loss += loss_value
+            epoch_batches += 1
+            global_step += 1
+            if writer is not None:
+                writer.add_scalar("train/batch_loss", loss_value, global_step)
+                for loss_name, loss_component in (getattr(outputs, "loss_dict", {}) or {}).items():
+                    writer.add_scalar(
+                        f"train/loss_components/{loss_name}",
+                        float(loss_component.detach()),
+                        global_step,
+                    )
             scaler.scale(loss).backward()
             if (step + 1) % accumulation == 0 or step + 1 == len(loader):
                 scaler.unscale_(optimizer)
@@ -194,6 +218,16 @@ def main() -> int:
             if args.mode == "smoke":
                 break
         scheduler.step()
+        average_epoch_loss = epoch_loss / max(1, epoch_batches)
+        if writer is not None:
+            writer.add_scalar("train/epoch_loss", average_epoch_loss, epoch + 1)
+        log_epoch_progress(
+            writer,
+            epoch_index=epoch,
+            total_epochs=total_epochs,
+            phase=phase,
+            learning_rate=float(optimizer.param_groups[0]["lr"]),
+        )
         metrics = None
         if phase == "aircraft_skin_finetuning":
             predictions, latencies = collect_predictions(
@@ -206,6 +240,7 @@ def main() -> int:
                 latencies_ms=latencies,
                 calibrate_threshold=True,
             )
+            log_numeric_metrics(writer, "validation", metrics, epoch + 1)
         metadata = {
             "version": f"epoch-{epoch + 1}",
             "epoch": epoch + 1,
@@ -231,10 +266,15 @@ def main() -> int:
                 "scaler": scaler.state_dict(),
                 "epoch": epoch,
                 "best_map": best_map,
+                "global_step": global_step,
                 "metadata": metadata,
             },
             training_state,
         )
+        if writer is not None:
+            writer.add_scalar("validation/best_map_50_95", best_map, epoch + 1)
+            writer.flush()
+    finish_tensorboard(writer)
     print(f"Completed {args.mode} Deformable DETR training; best validation mAP={best_map:.6f}")
     return 0
 

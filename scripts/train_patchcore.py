@@ -16,6 +16,11 @@ from src import load_config
 from src.baselines import PatchCoreBaseline
 from src.data import AeBADDataset, split_aebad_training_paths
 from src.evaluation import evaluate_engine_predictions
+from src.training_monitor import (
+    create_tensorboard_writer,
+    finish_tensorboard,
+    log_numeric_metrics,
+)
 
 
 def predict_dataset(model, loader):
@@ -66,7 +71,26 @@ def main() -> int:
         projection_dim=int(baseline["projection_dim"]),
         pretrained=True,
     )
-    model.fit(train_loader, smoke=args.mode == "smoke")
+    writer, _ = create_tensorboard_writer(config, "patchcore", args.mode)
+
+    def report_fit_progress(completed_batches, total_batches, retained_patches):
+        percent = 100.0 * completed_batches / max(1, total_batches)
+        print(
+            f"PatchCore feature extraction {completed_batches}/{total_batches} "
+            f"({percent:.1f}%); retained patches={retained_patches}",
+            flush=True,
+        )
+        if writer is not None:
+            writer.add_scalar("progress/percent", percent, completed_batches)
+            writer.add_scalar("fit/retained_patches", retained_patches, completed_batches)
+
+    model.fit(
+        train_loader,
+        smoke=args.mode == "smoke",
+        progress_callback=report_fit_progress,
+    )
+    if writer is not None:
+        writer.add_scalar("fit/memory_bank_patches", len(model.memory_bank), 1)
 
     validation_scores, validation_pixels = [], []
     for batch in validation_loader:
@@ -78,6 +102,18 @@ def main() -> int:
     quantile = float(engine["normal_threshold_quantile"])
     anomaly_threshold = float(np.quantile(validation_scores, quantile))
     pixel_threshold = float(np.quantile(np.concatenate(validation_pixels), quantile))
+    log_numeric_metrics(
+        writer,
+        "validation_calibration",
+        {
+            "anomaly_threshold": anomaly_threshold,
+            "pixel_threshold": pixel_threshold,
+            "normal_samples": len(validation_scores),
+            "score_mean": float(np.mean(validation_scores)),
+            "score_std": float(np.std(validation_scores)),
+        },
+        1,
+    )
     checkpoint_root = Path(config["paths"]["checkpoints"])
     checkpoint_path = (
         checkpoint_root / "smoke/patchcore_smoke.pt"
@@ -103,13 +139,15 @@ def main() -> int:
         )
         test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, num_workers=workers)
         result = predict_dataset(model, test_loader)
-        evaluate_engine_predictions(
+        evaluation_metrics = evaluate_engine_predictions(
             *result[:5],
             Path(config["paths"]["reports"]) / "baselines/patchcore",
             latencies_ms=result[5],
             pixel_threshold=pixel_threshold,
             anomaly_threshold=anomaly_threshold,
         )
+        log_numeric_metrics(writer, "test", evaluation_metrics, 1)
+    finish_tensorboard(writer)
     print(
         f"Completed {args.mode} PatchCore fitting with {len(model.memory_bank)} coreset patches."
     )

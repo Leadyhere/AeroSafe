@@ -129,7 +129,44 @@ For post-deployment hard-negative rounds, upload only inspector-confirmed normal
 
 Repeat for rounds 2 and 3 after reviewing new pilot images. Unlabeled images are not confirmed normals.
 
-## 6. Smoke-test, train, and evaluate
+## 6. Monitor training with TensorBoard
+
+Every training entry point writes TensorBoard events by default. The logs are kept below the configured
+reports directory, so a Kaggle run using `config.kaggle.yaml` writes to:
+
+```text
+/kaggle/working/aeroinspect/reports/tensorboard/
+  smoke/
+    deformable_detr/
+    faster_rcnn/
+    mmr_real/
+    patchcore/
+    mmr_bladesynth/
+  full/
+    deformable_detr/
+    faster_rcnn/
+    mmr_real/
+    patchcore/
+    mmr_bladesynth/
+```
+
+After at least one smoke or full training command has started, open the dashboard in a new notebook cell:
+
+```python
+%load_ext tensorboard
+%tensorboard --logdir /kaggle/working/aeroinspect/reports/tensorboard
+```
+
+Use `progress/percent` to see completion, `train/batch_loss` and `train/epoch_loss` for optimization,
+and the `validation/*` charts for model quality. Deformable DETR and Faster R-CNN log mAP, precision,
+recall, and detector loss components. Both MMR variants log reconstruction loss and held-out-normal
+calibration. PatchCore has no gradient epochs, so it logs feature-extraction percentage, retained
+patches, memory-bank size, calibration, and final evaluation metrics.
+
+TensorBoard progress is not an accuracy score. Final comparisons still come from
+`reports/model_comparison.json` after the frozen test evaluation.
+
+## 7. Smoke-test, train, and evaluate
 
 Run each stage in a separate notebook cell:
 
@@ -157,7 +194,7 @@ If a Kaggle session stops, resume the affected gradient-trained model with its s
 
 PatchCore fitting is deterministic and should be rerun instead of resumed.
 
-## 7. Preserve outputs
+## 8. Preserve outputs
 
 Before the Kaggle session ends, choose **Save Version** with outputs enabled or download:
 

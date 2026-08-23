@@ -24,6 +24,12 @@ from src.data import (
 )
 from src.engine_model import MaskedMultiScaleReconstruction
 from src.evaluation import evaluate_engine_predictions
+from src.training_monitor import (
+    create_tensorboard_writer,
+    finish_tensorboard,
+    log_epoch_progress,
+    log_numeric_metrics,
+)
 
 
 def seed_everything(seed: int) -> None:
@@ -145,6 +151,7 @@ def main() -> int:
         else f"engine{variant_suffix}_training_state.pt"
     )
     start_epoch = 0
+    global_step = 0
     if args.resume:
         checkpoint = torch.load(args.resume, map_location=model.device, weights_only=False)
         model.load_state_dict(checkpoint["state_dict"])
@@ -153,17 +160,28 @@ def main() -> int:
         if "scaler" in checkpoint:
             scaler.load_state_dict(checkpoint["scaler"])
         start_epoch = int(checkpoint["epoch"]) + 1
+        global_step = int(checkpoint.get("global_step", 0))
+    model_log_name = "mmr_real" if args.variant == "real" else "mmr_bladesynth"
+    writer, _ = create_tensorboard_writer(config, model_log_name, args.mode)
     for epoch in range(start_epoch, total_epochs):
         phase = "auxiliary_pretraining" if epoch < auxiliary_epochs else "aebad_s_finetuning"
         active_loader = auxiliary_loader if phase == "auxiliary_pretraining" else train_loader
         if active_loader is None:
             raise RuntimeError("Auxiliary MMR phase was selected without auxiliary data.")
         model.train()
+        epoch_loss = 0.0
+        epoch_batches = 0
         for batch in active_loader:
             images = batch["image"].to(model.device)
             optimizer.zero_grad(set_to_none=True)
             with torch.amp.autocast("cuda", enabled=amp_enabled):
                 output = model(images, mask_ratio=float(engine["mask_ratio"]))
+            loss_value = float(output["loss"].detach())
+            epoch_loss += loss_value
+            epoch_batches += 1
+            global_step += 1
+            if writer is not None:
+                writer.add_scalar("train/batch_loss", loss_value, global_step)
             scaler.scale(output["loss"]).backward()
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -172,6 +190,16 @@ def main() -> int:
             if args.mode == "smoke":
                 break
         scheduler.step()
+        average_epoch_loss = epoch_loss / max(1, epoch_batches)
+        if writer is not None:
+            writer.add_scalar("train/epoch_loss", average_epoch_loss, epoch + 1)
+        log_epoch_progress(
+            writer,
+            epoch_index=epoch,
+            total_epochs=total_epochs,
+            phase=phase,
+            learning_rate=float(optimizer.param_groups[0]["lr"]),
+        )
         if (epoch + 1) % int(config["training"].get("checkpoint_every", 1)) == 0:
             training_state.parent.mkdir(parents=True, exist_ok=True)
             torch.save(
@@ -181,10 +209,13 @@ def main() -> int:
                     "scheduler": scheduler.state_dict(),
                     "scaler": scaler.state_dict(),
                     "epoch": epoch,
+                    "global_step": global_step,
                     "metadata": {"config": config, "thresholds_calibrated": False},
                 },
                 training_state,
             )
+        if writer is not None:
+            writer.flush()
     # Calibration uses held-out training normals only, never the official final test set.
     validation_scores, validation_pixels = [], []
     for batch in validation_loader:
@@ -196,6 +227,16 @@ def main() -> int:
     quantile = float(engine["normal_threshold_quantile"])
     anomaly_threshold = float(np.quantile(validation_scores, quantile))
     pixel_threshold = float(np.quantile(np.concatenate(validation_pixels), quantile))
+    calibration_metrics = {
+        "anomaly_threshold": anomaly_threshold,
+        "pixel_threshold": pixel_threshold,
+        "normal_samples": len(validation_scores),
+        "score_mean": float(np.mean(validation_scores)),
+        "score_std": float(np.std(validation_scores)),
+        "score_min": float(np.min(validation_scores)),
+        "score_max": float(np.max(validation_scores)),
+    }
+    log_numeric_metrics(writer, "validation_calibration", calibration_metrics, total_epochs)
     metadata = {
         "version": f"epoch-{total_epochs}",
         "epoch": total_epochs,
@@ -242,6 +283,7 @@ def main() -> int:
             "scheduler": scheduler.state_dict(),
             "scaler": scaler.state_dict(),
             "epoch": total_epochs - 1,
+            "global_step": global_step,
             "metadata": metadata,
         },
         training_state,
@@ -266,7 +308,7 @@ def main() -> int:
             if args.variant == "real"
             else Path(config["paths"]["reports"]) / "experiments/bladesynth_mmr"
         )
-        evaluate_engine_predictions(
+        evaluation_metrics = evaluate_engine_predictions(
             labels,
             scores,
             np.asarray(masks),
@@ -277,6 +319,8 @@ def main() -> int:
             pixel_threshold=pixel_threshold,
             anomaly_threshold=anomaly_threshold,
         )
+        log_numeric_metrics(writer, "test", evaluation_metrics, total_epochs)
+    finish_tensorboard(writer)
     print(
         f"Completed {args.mode} MMR variant={args.variant}; thresholds calibrated from "
         "held-out AeBAD-S normal validation data."
