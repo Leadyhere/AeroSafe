@@ -59,6 +59,33 @@ def collect_predictions(detector, annotation_file: Path, limit: int | None = Non
     return predictions, latencies
 
 
+def resolve_epoch_window(
+    *, start_epoch: int, total_epochs: int, stop_after_epoch: int | None
+) -> range:
+    """Return the absolute, zero-based epoch range for this invocation.
+
+    ``stop_after_epoch`` is intentionally an absolute completed-epoch count,
+    rather than a per-run count. This makes a saved checkpoint safe to resume
+    across short Kaggle sessions without silently repeating epochs.
+    """
+    if start_epoch < 0 or total_epochs < 1:
+        raise ValueError("Epoch bounds must be non-negative with at least one total epoch.")
+    if start_epoch >= total_epochs:
+        return range(start_epoch, start_epoch)
+    if stop_after_epoch is None:
+        return range(start_epoch, total_epochs)
+    if not 1 <= stop_after_epoch <= total_epochs:
+        raise ValueError(
+            f"--stop-after-epoch must be between 1 and {total_epochs}, got {stop_after_epoch}."
+        )
+    if stop_after_epoch <= start_epoch:
+        raise ValueError(
+            f"The resumed checkpoint already completed epoch {start_epoch}; "
+            f"--stop-after-epoch must be greater than {start_epoch}."
+        )
+    return range(start_epoch, stop_after_epoch)
+
+
 def main() -> int:
     import torch
     from torch.utils.data import DataLoader, Subset, WeightedRandomSampler
@@ -67,6 +94,15 @@ def main() -> int:
     parser.add_argument("--mode", choices=("smoke", "full"), required=True)
     parser.add_argument("--config", default="config.yaml")
     parser.add_argument("--resume", default=None)
+    parser.add_argument(
+        "--stop-after-epoch",
+        type=int,
+        default=None,
+        help=(
+            "Finish cleanly after this absolute completed epoch (1-based). "
+            "Use it to create a resumable Kaggle training chunk."
+        ),
+    )
     args = parser.parse_args()
     config = load_config(args.config)
     seed = int(config["training"]["seed"])
@@ -163,6 +199,14 @@ def main() -> int:
         start_epoch = int(state["epoch"]) + 1
         best_map = float(state.get("best_map", -1.0))
         global_step = int(state.get("global_step", 0))
+    try:
+        epoch_window = resolve_epoch_window(
+            start_epoch=start_epoch,
+            total_epochs=total_epochs,
+            stop_after_epoch=args.stop_after_epoch,
+        )
+    except ValueError as exc:
+        parser.error(str(exc))
     accumulation = 1 if args.mode == "smoke" else int(config["aircraft"]["gradient_accumulation"])
     checkpoint_root = Path(config["paths"]["checkpoints"])
     reports_root = Path(config["paths"]["reports"])
@@ -181,7 +225,7 @@ def main() -> int:
         if dataset_report_path.is_file() else None
     )
     writer, _ = create_tensorboard_writer(config, "deformable_detr", args.mode)
-    for epoch in range(start_epoch, total_epochs):
+    for epoch in epoch_window:
         phase = "agdd_pretraining" if epoch < auxiliary_epochs else "aircraft_skin_finetuning"
         loader = auxiliary_loader if phase == "agdd_pretraining" else train_loader
         detector.model.train()
@@ -275,7 +319,14 @@ def main() -> int:
             writer.add_scalar("validation/best_map_50_95", best_map, epoch + 1)
             writer.flush()
     finish_tensorboard(writer)
-    print(f"Completed {args.mode} Deformable DETR training; best validation mAP={best_map:.6f}")
+    if epoch_window.stop < total_epochs:
+        print(
+            "Completed a resumable training chunk through "
+            f"epoch {epoch_window.stop}/{total_epochs}; resume with: "
+            f"--resume {training_state} --stop-after-epoch {total_epochs}"
+        )
+    else:
+        print(f"Completed {args.mode} Deformable DETR training; best validation mAP={best_map:.6f}")
     return 0
 
 

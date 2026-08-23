@@ -194,6 +194,25 @@ If a Kaggle session stops, resume the affected gradient-trained model with its s
 
 PatchCore fitting is deterministic and should be rerun instead of resumed.
 
+### Reliable short Kaggle runs
+
+Kaggle draft sessions can end before a long detector run finishes. Do not repeat completed work. The
+aircraft trainer can intentionally finish a short, resumable chunk after an **absolute** epoch number:
+
+```python
+# First saved chunk: epochs 1 through 8 (including the three AGDD epochs).
+!python scripts/train_aircraft.py --mode full --config config.kaggle.yaml --stop-after-epoch 8
+
+# After attaching the saved output checkpoint in a later Kaggle session, continue through epoch 16.
+!python scripts/train_aircraft.py --mode full --config config.kaggle.yaml \
+  --resume /kaggle/input/YOUR-SAVED-CHECKPOINTS/aircraft_training_state.pt \
+  --stop-after-epoch 16
+```
+
+After every completed chunk, choose **Save Version** with outputs enabled. Attach that version's output
+or upload the checkpoint as a private Kaggle dataset before the next chunk. Never close a draft session
+until its `checkpoints/aircraft_training_state.pt` has been preserved outside `/kaggle/working`.
+
 ## 8. Preserve outputs
 
 Before the Kaggle session ends, choose **Save Version** with outputs enabled or download:
