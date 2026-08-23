@@ -213,6 +213,17 @@ After every completed chunk, choose **Save Version** with outputs enabled. Attac
 or upload the checkpoint as a private Kaggle dataset before the next chunk. Never close a draft session
 until its `checkpoints/aircraft_training_state.pt` has been preserved outside `/kaggle/working`.
 
+The two other gradient-trained model families use the same absolute-epoch flag:
+
+```python
+!python scripts/train_faster_rcnn.py --mode full --config config.kaggle.yaml --stop-after-epoch 6
+!python scripts/train_engine.py --mode full --variant real --config config.kaggle.yaml --stop-after-epoch 6
+!python scripts/train_engine.py --mode full --variant bladesynth --config config.kaggle.yaml --stop-after-epoch 6
+```
+
+Resume each model only from its matching state file and variant. PatchCore is a single deterministic fit,
+not an epoch-trained model, so it should be run once and does not accept either chunk or resume flags.
+
 ## 8. Preserve outputs
 
 Before the Kaggle session ends, choose **Save Version** with outputs enabled or download:

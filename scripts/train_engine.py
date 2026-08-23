@@ -14,6 +14,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+from scripts.train_aircraft import resolve_epoch_window
 from src import load_config
 from src.data import (
     AeBADDataset,
@@ -57,6 +58,12 @@ def main() -> int:
     )
     parser.add_argument("--config", default="config.yaml")
     parser.add_argument("--resume", default=None)
+    parser.add_argument(
+        "--stop-after-epoch",
+        type=int,
+        default=None,
+        help="Finish cleanly after this absolute completed epoch (1-based).",
+    )
     args = parser.parse_args()
     config = load_config(args.config)
     engine = config["engine"]
@@ -161,9 +168,17 @@ def main() -> int:
             scaler.load_state_dict(checkpoint["scaler"])
         start_epoch = int(checkpoint["epoch"]) + 1
         global_step = int(checkpoint.get("global_step", 0))
+    try:
+        epoch_window = resolve_epoch_window(
+            start_epoch=start_epoch,
+            total_epochs=total_epochs,
+            stop_after_epoch=args.stop_after_epoch,
+        )
+    except ValueError as exc:
+        parser.error(str(exc))
     model_log_name = "mmr_real" if args.variant == "real" else "mmr_bladesynth"
     writer, _ = create_tensorboard_writer(config, model_log_name, args.mode)
-    for epoch in range(start_epoch, total_epochs):
+    for epoch in epoch_window:
         phase = "auxiliary_pretraining" if epoch < auxiliary_epochs else "aebad_s_finetuning"
         active_loader = auxiliary_loader if phase == "auxiliary_pretraining" else train_loader
         if active_loader is None:
@@ -200,7 +215,10 @@ def main() -> int:
             phase=phase,
             learning_rate=float(optimizer.param_groups[0]["lr"]),
         )
-        if (epoch + 1) % int(config["training"].get("checkpoint_every", 1)) == 0:
+        if (
+            (epoch + 1) % int(config["training"].get("checkpoint_every", 1)) == 0
+            or epoch + 1 == epoch_window.stop
+        ):
             training_state.parent.mkdir(parents=True, exist_ok=True)
             torch.save(
                 {
@@ -216,6 +234,13 @@ def main() -> int:
             )
         if writer is not None:
             writer.flush()
+    if epoch_window.stop < total_epochs:
+        finish_tensorboard(writer)
+        print(
+            f"Completed a resumable MMR variant={args.variant} chunk through "
+            f"epoch {epoch_window.stop}/{total_epochs}; resume from {training_state}."
+        )
+        return 0
     # Calibration uses held-out training normals only, never the official final test set.
     validation_scores, validation_pixels = [], []
     for batch in validation_loader:

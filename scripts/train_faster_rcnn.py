@@ -14,7 +14,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from scripts.train_aircraft import collect_predictions
+from scripts.train_aircraft import collect_predictions, resolve_epoch_window
 from src import load_config
 from src.baselines import FasterRCNNBaseline, FasterRCNNDataset, collate_faster_rcnn
 from src.data import detection_sampling_weights
@@ -36,6 +36,12 @@ def main() -> int:
     parser.add_argument("--mode", choices=("smoke", "full"), required=True)
     parser.add_argument("--config", default="config.yaml")
     parser.add_argument("--resume", default=None)
+    parser.add_argument(
+        "--stop-after-epoch",
+        type=int,
+        default=None,
+        help="Finish cleanly after this absolute completed epoch (1-based).",
+    )
     args = parser.parse_args()
     config = load_config(args.config)
     baseline = config["baselines"]["faster_rcnn"]
@@ -132,9 +138,17 @@ def main() -> int:
         start_epoch = int(state["epoch"]) + 1
         best_map = float(state.get("best_map", -1.0))
         global_step = int(state.get("global_step", 0))
+    try:
+        epoch_window = resolve_epoch_window(
+            start_epoch=start_epoch,
+            total_epochs=total_epochs,
+            stop_after_epoch=args.stop_after_epoch,
+        )
+    except ValueError as exc:
+        parser.error(str(exc))
 
     writer, _ = create_tensorboard_writer(config, "faster_rcnn", args.mode)
-    for epoch in range(start_epoch, total_epochs):
+    for epoch in epoch_window:
         phase = "agdd_pretraining" if epoch < auxiliary_epochs else "aircraft_skin_finetuning"
         loader = auxiliary_loader if phase == "agdd_pretraining" else train_loader
         model.model.train()
@@ -225,7 +239,13 @@ def main() -> int:
             writer.add_scalar("validation/best_map_50_95", best_map, epoch + 1)
             writer.flush()
     finish_tensorboard(writer)
-    print(f"Completed {args.mode} Faster R-CNN training; best validation mAP={best_map:.6f}")
+    if epoch_window.stop < total_epochs:
+        print(
+            "Completed a resumable Faster R-CNN chunk through "
+            f"epoch {epoch_window.stop}/{total_epochs}; resume from {state_path}."
+        )
+    else:
+        print(f"Completed {args.mode} Faster R-CNN training; best validation mAP={best_map:.6f}")
     return 0
 
 
