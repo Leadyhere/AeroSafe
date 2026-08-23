@@ -19,9 +19,15 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", default="config.yaml")
     parser.add_argument("--report", default=None)
+    parser.add_argument(
+        "--scope",
+        choices=("all", "aircraft", "engine"),
+        default="all",
+        help="Prepare only the datasets needed for one training task.",
+    )
     args = parser.parse_args()
     try:
-        report = prepare_datasets(load_config(args.config), args.report)
+        report = prepare_datasets(load_config(args.config), args.report, scope=args.scope)
     except DatasetConfigurationError as exc:
         parser.error(str(exc))
     print(json.dumps(report, indent=2))

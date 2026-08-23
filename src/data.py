@@ -1457,44 +1457,60 @@ def _resolve_aebad_s_root(root: Path) -> Path:
     )
 
 
-def prepare_datasets(config: Mapping[str, Any], report_path: str | Path | None = None) -> dict[str, Any]:
-    """Prepare configured real datasets and write a truthful, generated report."""
-    # Run inexpensive completeness checks before the slow aircraft duplicate
-    # analysis so an unfinished archive fails quickly and clearly.
-    train_paths, validation_paths = split_aebad_training_paths(
-        config["paths"]["aebad"],
-        float(config["engine"]["validation_fraction"]),
-        int(config["training"]["seed"]),
-    )
-    aebad_test = AeBADDataset(
-        config["paths"]["aebad"], "test", image_size=int(config["engine"]["image_size"])
-    )
-    missing_masks = []
-    for image_path in aebad_test.paths:
-        parts = {part.lower() for part in image_path.parts}
-        if not ({"good", "normal"} & parts) and aebad_test._mask_path(image_path) is None:
-            missing_masks.append(str(image_path))
-    if missing_masks:
-        raise DatasetConfigurationError(
-            f"AeBAD-S has {len(missing_masks)} anomalous test images without masks; first: "
-            f"{missing_masks[:3]}"
+def prepare_datasets(
+    config: Mapping[str, Any],
+    report_path: str | Path | None = None,
+    *,
+    scope: str = "all",
+) -> dict[str, Any]:
+    """Prepare only the configured datasets required for ``scope``.
+
+    Splitting aircraft and engine preparation avoids mounting or scanning the
+    24-GB synthetic BladeSynth archive when a user is only training the
+    aircraft detector (for example, in a free Colab session).
+    """
+    if scope not in {"all", "aircraft", "engine"}:
+        raise ValueError("scope must be one of: all, aircraft, engine")
+    report: dict[str, Any] = {"scope": scope}
+    if scope in {"all", "aircraft"}:
+        imdd_report = audit_imdd_aircraft_subset(
+            config["paths"]["imdd_aircraft_images"], config["paths"]["imdd_aircraft_csv"]
         )
-    video_paths = sample_aebad_v_training_paths(
-        config["paths"]["aebad"], int(config["engine"]["aebad_v_frame_stride"])
-    )
-    bladesynth_report = audit_bladesynth(
-        config["paths"]["bladesynth"],
-        int(config["engine"].get("bladesynth_expected_images_per_class", 2500)),
-    )
-    bladesynth_paths = find_bladesynth_normal_paths(config["paths"]["bladesynth"])
-    imdd_report = audit_imdd_aircraft_subset(
-        config["paths"]["imdd_aircraft_images"], config["paths"]["imdd_aircraft_csv"]
-    )
-    aircraft_report = prepare_aircraft_data(config)
-    report = {
-        "aircraft": aircraft_report,
-        "aircraft_image_level_auxiliary": {"source": "IMDD aircraft subset", **imdd_report},
-        "engine": {
+        report["aircraft"] = prepare_aircraft_data(config)
+        report["aircraft_image_level_auxiliary"] = {
+            "source": "IMDD aircraft subset",
+            **imdd_report,
+        }
+    if scope in {"all", "engine"}:
+        # Run engine completeness checks before the synthetic archive audit so
+        # an incomplete AeBAD extraction fails quickly and clearly.
+        train_paths, validation_paths = split_aebad_training_paths(
+            config["paths"]["aebad"],
+            float(config["engine"]["validation_fraction"]),
+            int(config["training"]["seed"]),
+        )
+        aebad_test = AeBADDataset(
+            config["paths"]["aebad"], "test", image_size=int(config["engine"]["image_size"])
+        )
+        missing_masks = []
+        for image_path in aebad_test.paths:
+            parts = {part.lower() for part in image_path.parts}
+            if not ({"good", "normal"} & parts) and aebad_test._mask_path(image_path) is None:
+                missing_masks.append(str(image_path))
+        if missing_masks:
+            raise DatasetConfigurationError(
+                f"AeBAD-S has {len(missing_masks)} anomalous test images without masks; first: "
+                f"{missing_masks[:3]}"
+            )
+        video_paths = sample_aebad_v_training_paths(
+            config["paths"]["aebad"], int(config["engine"]["aebad_v_frame_stride"])
+        )
+        bladesynth_report = audit_bladesynth(
+            config["paths"]["bladesynth"],
+            int(config["engine"].get("bladesynth_expected_images_per_class", 2500)),
+        )
+        bladesynth_paths = find_bladesynth_normal_paths(config["paths"]["bladesynth"])
+        report["engine"] = {
             "source": "AeBAD-S",
             "train_normal": len(train_paths),
             "validation_normal": len(validation_paths),
@@ -1509,8 +1525,7 @@ def prepare_datasets(config: Mapping[str, Any], report_path: str | Path | None =
                 "used_for_threshold_calibration": False,
                 "used_for_final_test": False,
             },
-        },
-    }
+        }
     destination = Path(report_path or Path(config["paths"]["reports"]) / "dataset_report.json")
     destination.parent.mkdir(parents=True, exist_ok=True)
     destination.write_text(json.dumps(report, indent=2), encoding="utf-8")
