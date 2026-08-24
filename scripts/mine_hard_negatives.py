@@ -14,8 +14,18 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from src import load_config
 from src.aircraft_model import AircraftDetector
+from src.baselines import FasterRCNNBaseline
 from src.inference import predict_aircraft_tiled
 from src.preprocessing import SUPPORTED_IMAGE_EXTENSIONS, load_image, sha256_file
+
+
+def load_mining_model(model_name: str, checkpoint: str | Path):
+    """Load one of the two aircraft detectors behind their shared prediction API."""
+    if model_name == "deformable_detr":
+        return AircraftDetector.load(checkpoint)
+    if model_name == "faster_rcnn":
+        return FasterRCNNBaseline.load(checkpoint)
+    raise ValueError(f"Unsupported mining model: {model_name}")
 
 
 def main() -> int:
@@ -24,6 +34,12 @@ def main() -> int:
     parser.add_argument("--round", type=int, choices=(1, 2, 3), required=True)
     parser.add_argument("--config", default="config.yaml")
     parser.add_argument("--checkpoint", default=None)
+    parser.add_argument(
+        "--model",
+        choices=("deformable_detr", "faster_rcnn"),
+        default="deformable_detr",
+        help="Detector whose false positives should be mined.",
+    )
     parser.add_argument("--threshold", type=float, default=0.20)
     parser.add_argument(
         "--confirmed-normal",
@@ -47,7 +63,13 @@ def main() -> int:
     )
     if not candidates:
         parser.error(f"No supported images found under {source}")
-    model = AircraftDetector.load(args.checkpoint or config["aircraft"]["checkpoint"])
+    default_checkpoint = (
+        config["aircraft"]["checkpoint"]
+        if args.model == "deformable_detr"
+        else config["baselines"]["faster_rcnn"]["checkpoint"]
+    )
+    checkpoint = args.checkpoint or default_checkpoint
+    model = load_mining_model(args.model, checkpoint)
     tile_config = config["aircraft"].get("tiled_inference", {})
     selected = []
     fingerprints: set[str] = set()
@@ -122,6 +144,8 @@ def main() -> int:
                 "unique_images": len(fingerprints),
                 "selected_false_positive_images": len(selected),
                 "threshold": args.threshold,
+                "model_type": args.model,
+                "checkpoint": str(Path(checkpoint)),
                 "model_version": model.version,
                 "items": score_rows,
             },

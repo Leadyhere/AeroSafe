@@ -136,16 +136,34 @@ The application may first be deployed as an **assistive pilot**, not an autonomo
 Place only human-confirmed defect-free pilot images in a normal pool, then run:
 
 ```bash
-python scripts/mine_hard_negatives.py --normal-dir /path/to/confirmed-normal-pool --round 1 --confirmed-normal
+python scripts/mine_hard_negatives.py --model deformable_detr --normal-dir /path/to/confirmed-normal-pool --round 1 --confirmed-normal
+python scripts/mine_hard_negatives.py --model faster_rcnn --normal-dir /path/to/confirmed-normal-pool --round 1 --confirmed-normal
 python scripts/prepare_data.py
 python scripts/train_aircraft.py --mode full
 python scripts/train_faster_rcnn.py --mode full
 ```
 
-Repeat with `--round 2` and optionally `--round 3`. The miner selects images that produced false alarms,
-stores them as zero-annotation training images under `data/hard_negatives/reviewed`, and records every
-prediction in `mining_report.json`. Never apply `--confirmed-normal` to merely unlabeled images. Missed
-defects require a human to add real boxes; absence of a prediction cannot locate a missed defect.
+Use a separate round number for each completed review/mining pass; one round can use either detector or a
+combined, deduplicated normal pool. The miner selects images that produced false alarms, stores them as
+zero-annotation training images under `data/hard_negatives/reviewed`, and records the chosen model and every
+prediction in `mining_report.json`. Repeat with round 2 and optionally round 3. Never apply
+`--confirmed-normal` to merely unlabeled images. Missed defects require a human to add real boxes; absence
+of a prediction cannot locate a missed defect.
+
+### Verified training archives
+
+Package only the trained model, resumable state, reports, and Kaggle configuration, then verify every file
+inside the gzip stream before downloading it:
+
+```bash
+python scripts/package_training_artifact.py \
+  --model faster_rcnn \
+  --output /kaggle/working/faster_rcnn_final_epoch_23.tar.gz
+```
+
+The command also creates a `.sha256` sidecar. A browser download is complete only when its local SHA-256
+matches that sidecar; a filename appearing in Downloads is not sufficient evidence. Add
+`--deployment-only` only when optimizer/scheduler state is intentionally unnecessary.
 
 ## Deformable DETR
 

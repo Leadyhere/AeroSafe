@@ -121,13 +121,26 @@ the preparer still groups exact, near, and generated derivatives but reports zer
 For post-deployment hard-negative rounds, upload only inspector-confirmed normal images and run round 1:
 
 ```python
-!python scripts/mine_hard_negatives.py --normal-dir /kaggle/input/CONFIRMED-NORMALS --round 1 --confirmed-normal
+!python scripts/mine_hard_negatives.py --model deformable_detr --normal-dir /kaggle/input/CONFIRMED-NORMALS --round 1 --confirmed-normal
+!python scripts/mine_hard_negatives.py --model faster_rcnn --normal-dir /kaggle/input/CONFIRMED-NORMALS --round 1 --confirmed-normal
 !python scripts/prepare_data.py --config config.yaml
 !python scripts/train_aircraft.py --mode full --config config.yaml
 !python scripts/train_faster_rcnn.py --mode full --config config.yaml
 ```
 
 Repeat for rounds 2 and 3 after reviewing new pilot images. Unlabeled images are not confirmed normals.
+
+Before downloading a long-run checkpoint, create a verified archive instead of manually tarring the whole
+workspace:
+
+```python
+!python scripts/package_training_artifact.py \
+    --model faster_rcnn \
+    --output /kaggle/working/faster_rcnn_final_epoch_23.tar.gz
+```
+
+The packager reads the completed gzip stream back, verifies every member against a SHA-256 manifest, and
+writes `faster_rcnn_final_epoch_23.tar.gz.sha256`. Download both files and verify the checksum locally.
 
 ## 6. Monitor training with TensorBoard
 
