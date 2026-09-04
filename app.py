@@ -199,12 +199,28 @@ def history_page():
 def performance_page():
     st.title("Model Performance")
     report_root = PROJECT_ROOT / CONFIG["paths"]["reports"]
-    for title, filename, keys in [
-        ("Aircraft — Deformable DETR", "aircraft_metrics.json", ["map_50", "map_50_95", "precision", "recall", "f1"]),
-        ("Aircraft baseline — Faster R-CNN", "baselines/faster_rcnn/aircraft_metrics.json", ["map_50", "map_50_95", "precision", "recall", "f1"]),
-        ("Engine — MMR", "engine_metrics.json", ["image_auroc", "pixel_auroc", "aupro", "dice", "iou"]),
-        ("Engine baseline — PatchCore", "baselines/patchcore/engine_metrics.json", ["image_auroc", "pixel_auroc", "aupro", "dice", "iou"]),
-    ]:
+    detector_keys = ["map_50", "map_50_95", "precision", "recall", "f1"]
+    anomaly_keys = ["image_auroc", "image_average_precision", "pixel_auroc", "aupro", "dice", "iou"]
+    model_reports = [
+        ("Aircraft - currently deployed", "aircraft_metrics.json", detector_keys),
+        *[
+            (
+                f"Aircraft transformer - {name.replace('_', ' ').upper()}",
+                f"aircraft_transformers/{name}/aircraft_metrics.json",
+                detector_keys,
+            )
+            for name in CONFIG["aircraft"].get("transformer_candidates", {})
+        ],
+        ("Aircraft baseline - Faster R-CNN", "baselines/faster_rcnn/aircraft_metrics.json", detector_keys),
+        ("Engine - MMR", "engine_metrics.json", anomaly_keys),
+        (
+            "Engine transformer experiment - MMR + BladeSynth",
+            "experiments/bladesynth_mmr/engine_metrics.json",
+            anomaly_keys,
+        ),
+        ("Engine baseline - PatchCore", "baselines/patchcore/engine_metrics.json", anomaly_keys),
+    ]
+    for title, filename, keys in model_reports:
         st.subheader(title)
         path = report_root / filename
         if not path.is_file():
@@ -227,8 +243,8 @@ def about_page():
     st.markdown(
         """
 ### Aircraft exterior
-Deformable DETR fine-tunes a pretrained multi-scale detector. Sparse deformable attention focuses on
-relevant sampling points, while learned object queries and Hungarian matching support multiple defects.
+RT-DETR v2, RT-DETR, and Deformable DETR are fine-tuned independently on the same binary defect-localization
+split. The deployed model is changed only after frozen-test mAP and missed-defect comparisons.
 
 ### Aero-engine blade
 MMR learns normal blade structure. A masked MAE/ViT branch reconstructs frozen hierarchical teacher

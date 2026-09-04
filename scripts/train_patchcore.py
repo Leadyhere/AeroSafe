@@ -16,6 +16,7 @@ from src import load_config
 from src.baselines import PatchCoreBaseline
 from src.data import AeBADDataset, split_aebad_training_paths
 from src.evaluation import evaluate_engine_predictions
+from src.training_artifacts import artifact_output_path, create_training_archive
 from src.training_monitor import (
     create_tensorboard_writer,
     finish_tensorboard,
@@ -134,6 +135,7 @@ def main() -> int:
     model.save(checkpoint_path, metadata)
 
     if args.mode == "full":
+        evaluation_root = Path(config["paths"]["reports"]) / "baselines/patchcore"
         test_dataset = AeBADDataset(
             config["paths"]["aebad"], "test", image_size=int(engine["image_size"])
         )
@@ -141,13 +143,35 @@ def main() -> int:
         result = predict_dataset(model, test_loader)
         evaluation_metrics = evaluate_engine_predictions(
             *result[:5],
-            Path(config["paths"]["reports"]) / "baselines/patchcore",
+            evaluation_root,
             latencies_ms=result[5],
             pixel_threshold=pixel_threshold,
             anomaly_threshold=anomaly_threshold,
         )
         log_numeric_metrics(writer, "test", evaluation_metrics, 1)
     finish_tensorboard(writer)
+    if args.mode == "full":
+        artifact_path = artifact_output_path(
+            config["paths"].get("artifacts", "artifacts"),
+            "patchcore",
+            1,
+            1,
+            part=1,
+        )
+        artifact = create_training_archive(
+            PROJECT_ROOT,
+            "patchcore",
+            artifact_path,
+            [
+                checkpoint_path,
+                evaluation_root,
+                Path(config["paths"]["reports"]) / "dataset_report.json",
+                Path(args.config),
+            ],
+            run_metadata={"completed_fits": 1, "total_fits": 1, "resumable": False},
+        )
+        print(f"Downloadable artifact: {artifact['archive']['path']}")
+        print(f"SHA-256 file: {artifact['archive']['checksum_file']}")
     print(
         f"Completed {args.mode} PatchCore fitting with {len(model.memory_bank)} coreset patches."
     )

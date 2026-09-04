@@ -1,250 +1,168 @@
 # Kaggle training runbook
 
-This runbook prepares the downloaded datasets, smoke-tests all four models, trains them, and performs
-final evaluation. Keep every dataset separate; the preparation code combines only compatible labels and
-preserves source metadata.
+This is the complete AeroInspect training plan. It contains seven fair training runs: five
+transformer-based runs and two comparison baselines. Do not run all full models in one notebook session.
+Run one command at a time, save the Kaggle version, and download the generated archive.
 
-## 1. Finish and extract BladeSynth
+## Models, datasets, and estimated Kaggle T4 time
 
-`Unconfirmed 93855.crdownload` is an incomplete Chrome download. It cannot be uploaded to Kaggle or used
-for training. Wait until Chrome finishes and renames it to `Dataset_bladesynth.rar`, then extract the RAR.
-The configured extracted directory is `Dataset_bladesynth/`.
+Times are planning ranges, not guarantees. Kaggle GPU type, image loading speed, and validation time vary.
+The code measures real epoch time and exits early when continuing could exceed the configured 11-hour
+session budget, leaving 45 minutes to package the result.
 
-Do not rename the `.crdownload` file manually. If Chrome reports that the download failed, resume it in
-Chrome or restart the download.
+| Run | Type | Purpose | Training data | Epoch plan | Approx. T4 time |
+|---|---|---|---|---:|---:|
+| RT-DETR v2 | Transformer | Primary aircraft localizer | AGDD, then binary ASDD + aircraftsurface1 | 3 + 20, one logical run | 8-16 h |
+| RT-DETR | Transformer | Real-time transformer comparison | Same aircraft split | 3 + 20, one logical run | 8-16 h |
+| Deformable DETR | Transformer | Multi-scale transformer comparison | Same aircraft split | 3 + 20, one logical run | 10-20 h |
+| MMR real | Transformer hybrid | Primary engine anomaly score and heatmap | AeBAD-S normal images | 200; 50/50/50/50 | 6-10 h total |
+| MMR + BladeSynth | Transformer-hybrid experiment | Test auxiliary normal-domain pretraining | AeBAD-V normals + BladeSynth Normal, then AeBAD-S | 5 + 200; endpoints 55/105/155/205 | 8-14 h total |
+| Faster R-CNN | CNN baseline | Prove whether transformers improve aircraft results | Same aircraft split | 3 + 20, one logical run | 8-16 h |
+| PatchCore | CNN baseline | Engine anomaly comparison | AeBAD-S normal images | One fit | 0.5-1.5 h |
 
-## 2. Create Kaggle datasets
+The combined estimate is roughly 49-94 T4 GPU-hours. Each individual notebook session remains under 12
+hours. A 20-epoch model is attempted in one logical run; if real measured speed makes that unsafe, it stops,
+archives the completed epochs, and resumes when the same command is run again.
 
-Upload the following directories/files as private Kaggle datasets. Large datasets may be split into more
-than one Kaggle input; the code only needs the final paths.
+## Dataset rules
 
-| Local item | Purpose |
+- Aircraft training uses one reliable `defect` class. Original source labels remain in the audit report.
+- AGDD is auxiliary box pretraining. ASDD and aircraftsurface1 form the grouped main split.
+- IMDD has image labels but no boxes, so it is excluded from localization training.
+- MMR and PatchCore fit only normal images. The official AeBAD-S test set never calibrates thresholds.
+- BladeSynth anomalies are never treated as normal.
+- Exact and near duplicates stay within a single train/validation/test group.
+
+## 1. Upload datasets
+
+Create private Kaggle datasets from these extracted local folders/files:
+
+| Local item | Used by |
 |---|---|
-| `Dataset2.v2-defect-classification.coco/` | ASDD detector fine-tuning |
-| `aircraftsurface1.v1i.coco/` | Aircraft detector fine-tuning |
-| `AGDD-main/` | AGDD detector auxiliary pretraining |
-| `0to4_aircraft_skin4000pics/` and `0-4aircraft4000.csv` | IMDD integrity audit only; no boxes exist |
-| `AeBAD/AeBAD/` | AeBAD-S training/test plus AeBAD-V normal auxiliary frames |
-| extracted `Dataset_bladesynth/` | BladeSynth Normal-only MMR auxiliary pretraining |
+| `Dataset2.v2-defect-classification.coco/` | Aircraft models |
+| `aircraftsurface1.v1i.coco/` | Aircraft models |
+| `AGDD-main/` | Aircraft auxiliary pretraining |
+| `0to4_aircraft_skin4000pics/` and `0-4aircraft4000.csv` | Audit only |
+| `AeBAD/AeBAD/` | MMR and PatchCore |
+| `Dataset_bladesynth/` | Separate MMR + BladeSynth experiment |
 
-For each Kaggle dataset: open **Datasets → New Dataset**, upload the corresponding folder (or a ZIP), set
-visibility to **Private**, and create it. Kaggle automatically extracts ZIP files, but RAR extraction is
-not dependable; upload the already-extracted BladeSynth directory.
+Do not upload an unfinished `.crdownload`. Extract RAR archives locally before uploading them.
 
-## 3. Create the notebook
+## 2. Create the GPU notebook
 
-Create a Kaggle notebook, choose a GPU accelerator, enable Internet for pretrained-weight downloads, and
-attach every private Kaggle dataset from the notebook's **Add Input** panel.
-
-Clone and install AeroInspect:
+Choose a T4/P100 GPU, enable Internet for the first pretrained-weight download, and attach all private
+datasets. Then run:
 
 ```python
 !git clone https://github.com/Leadyhere/AeroSafe.git /kaggle/working/aeroinspect
 %cd /kaggle/working/aeroinspect
 !pip install -q -r requirements.txt
-```
-
-Inspect the exact mounted names before editing the configuration:
-
-```python
 !find /kaggle/input -maxdepth 5 -type d | head -200
 ```
 
-## 4. Set the exact paths
-
-Edit only the `paths` block in `config.yaml`. Replace every `YOUR-...-SLUG` with the name shown under
-`/kaggle/input`. The directory may have one additional wrapper level depending on how it was uploaded.
+Update the `paths` values in `config.yaml` to the exact mounted paths. Outputs must stay under
+`/kaggle/working/aeroinspect`:
 
 ```yaml
 paths:
-  asdd: /kaggle/input/YOUR-ASDD-SLUG/Dataset2.v2-defect-classification.coco
-  aircraftsurface: /kaggle/input/YOUR-AIRCRAFTSURFACE-SLUG/aircraftsurface1.v1i.coco
-  agdd: /kaggle/input/YOUR-AGDD-SLUG/AGDD-main
-  imdd_aircraft_images: /kaggle/input/YOUR-IMDD-SLUG/0to4_aircraft_skin4000pics
-  imdd_aircraft_csv: /kaggle/input/YOUR-IMDD-SLUG/0-4aircraft4000.csv
-  imdd_localization: /kaggle/input/YOUR-REVIEWED-IMDD-SLUG/imdd_localization_reviewed
-  hard_negatives: /kaggle/working/aeroinspect/data/hard_negatives/reviewed
-  group_manifest: /kaggle/input/YOUR-METADATA-SLUG/aerosafe_group_manifest.csv
-  aebad: /kaggle/input/YOUR-AEBAD-SLUG/AeBAD/AeBAD
-  bladesynth: /kaggle/input/YOUR-BLADESYNTH-SLUG/Dataset_bladesynth
-  external_iisc: /kaggle/input/not-used
+  asdd: /kaggle/input/YOUR-ASDD/Dataset2.v2-defect-classification.coco
+  aircraftsurface: /kaggle/input/YOUR-AIRCRAFT/aircraftsurface1.v1i.coco
+  agdd: /kaggle/input/YOUR-AGDD/AGDD-main
+  imdd_aircraft_images: /kaggle/input/YOUR-IMDD/0to4_aircraft_skin4000pics
+  imdd_aircraft_csv: /kaggle/input/YOUR-IMDD/0-4aircraft4000.csv
+  aebad: /kaggle/input/YOUR-AEBAD/AeBAD/AeBAD
+  bladesynth: /kaggle/input/YOUR-BLADESYNTH/Dataset_bladesynth
   processed: /kaggle/working/aeroinspect/data/processed
   checkpoints: /kaggle/working/aeroinspect/checkpoints
   reports: /kaggle/working/aeroinspect/reports
-  database: /kaggle/working/aeroinspect/data/aeroinspect.sqlite3
-  inspections: /kaggle/working/aeroinspect/data/inspections
+  artifacts: /kaggle/working/aeroinspect/artifacts
 ```
 
-The AeBAD adapter accepts either the parent that contains `AeBAD_S/` and `AeBAD_V/` or the `AeBAD_S/`
-directory itself, but the parent is required here because MMR also uses normal AeBAD-V training frames.
-
-## 5. Prepare and verify
-
-Run preparation first:
+## 3. Prepare and smoke-test once
 
 ```python
 !python scripts/kaggle_train_all.py --stage prepare --config config.yaml
+!python scripts/kaggle_train_all.py --stage smoke --config config.yaml
+!python scripts/kaggle_train_all.py --stage plan --config config.yaml
 ```
 
-This command must finish successfully and create `reports/dataset_report.json`. It checks annotation
-formats, image decoding, missing masks, class mappings, exact/near duplicates, and minimum BladeSynth
-Normal-image count. Do not continue if it raises an error; correct the named path or incomplete dataset.
+Preparation must report `task_mode: binary`, one `defect` category, and no split leakage. Smoke mode uses
+only a tiny real subset; it checks code and GPU compatibility but does not produce meaningful accuracy.
 
-Scientific data use is intentionally staged:
+## 4. Train aircraft models
 
-- Deformable DETR and Faster R-CNN pretrain on mapped AGDD boxes, then fine-tune on the cleaned combined
-  ASDD + aircraftsurface1 detector split.
-- IMDD's 4,281 images have image-level CSV labels but no bounding boxes, so they are audited and excluded
-  from object-detector training. Creating full-image fake boxes would damage localization training.
-- The primary MMR is trained only on real AeBAD-S normals. A second, separately checkpointed experiment
-  pretrains on sampled real AeBAD-V normals plus BladeSynth's `Normal` class, then fine-tunes on AeBAD-S.
-- Both MMR variants calibrate thresholds only with held-out real AeBAD-S normals. BladeSynth anomaly
-  images are never treated as normal, and experimental metrics are written under
-  `reports/experiments/bladesynth_mmr/` rather than mixed into the four-model comparison.
-- PatchCore remains a clean real-data baseline fitted only on the same AeBAD-S normal split.
-
-After the first full Deformable DETR run, create IMDD proposals:
+Run each command in its own Kaggle session/version:
 
 ```python
-!python scripts/bootstrap_imdd_boxes.py --config config.yaml
+!python scripts/kaggle_train_all.py --stage train --model rt_detr_v2 --quarter 1 --config config.yaml
+!python scripts/kaggle_train_all.py --stage train --model rt_detr --quarter 1 --config config.yaml
+!python scripts/kaggle_train_all.py --stage train --model deformable_detr --quarter 1 --config config.yaml
+!python scripts/kaggle_train_all.py --stage train --model faster_rcnn --quarter 1 --config config.yaml
 ```
 
-Download `data/annotation_tasks/imdd_proposals.json`, import it with the IMDD images into CVAT/Roboflow,
-correct every selected image, and export COCO. Put that reviewed export in a separate Kaggle Dataset with
-an empty file named `REVIEWED`, update `imdd_localization`, rerun preparation, and retrain both detectors.
-Unreviewed proposals and whole-image boxes are refused.
+These have 20 main epochs and therefore one logical part. If the time guard exits before epoch 23, save the
+Kaggle version and rerun the identical command after restoring the archive. It resumes automatically.
 
-If your datasets provide aircraft/tail/session/video/camera identifiers, attach a completed copy of
-`docs/group_manifest.example.csv`. If they do not, leave `group_manifest` pointing to a nonexistent path;
-the preparer still groups exact, near, and generated derivatives but reports zero explicit metadata.
+## 5. Train engine models
 
-For post-deployment hard-negative rounds, upload only inspector-confirmed normal images and run round 1:
+MMR is explicitly divided into four quarters:
 
 ```python
-!python scripts/mine_hard_negatives.py --model deformable_detr --normal-dir /kaggle/input/CONFIRMED-NORMALS --round 1 --confirmed-normal
-!python scripts/mine_hard_negatives.py --model faster_rcnn --normal-dir /kaggle/input/CONFIRMED-NORMALS --round 1 --confirmed-normal
-!python scripts/prepare_data.py --config config.yaml
-!python scripts/train_aircraft.py --mode full --config config.yaml
-!python scripts/train_faster_rcnn.py --mode full --config config.yaml
+!python scripts/kaggle_train_all.py --stage train --model mmr_real --quarter 1 --config config.yaml
+!python scripts/kaggle_train_all.py --stage train --model mmr_real --quarter 2 --config config.yaml
+!python scripts/kaggle_train_all.py --stage train --model mmr_real --quarter 3 --config config.yaml
+!python scripts/kaggle_train_all.py --stage train --model mmr_real --quarter 4 --config config.yaml
+
+!python scripts/kaggle_train_all.py --stage train --model mmr_bladesynth --quarter 1 --config config.yaml
+!python scripts/kaggle_train_all.py --stage train --model mmr_bladesynth --quarter 2 --config config.yaml
+!python scripts/kaggle_train_all.py --stage train --model mmr_bladesynth --quarter 3 --config config.yaml
+!python scripts/kaggle_train_all.py --stage train --model mmr_bladesynth --quarter 4 --config config.yaml
+
+!python scripts/kaggle_train_all.py --stage train --model patchcore --quarter 1 --config config.yaml
 ```
 
-Repeat for rounds 2 and 3 after reviewing new pilot images. Unlabeled images are not confirmed normals.
+Part 2 refuses to start unless part 1 is complete; the same rule applies to later parts. This prevents
+silently skipping epochs.
 
-Before downloading a long-run checkpoint, create a verified archive instead of manually tarring the whole
-workspace:
+## 6. Preserve and resume every output
 
-```python
-!python scripts/package_training_artifact.py \
-    --model faster_rcnn \
-    --output /kaggle/working/faster_rcnn_final_epoch_23.tar.gz
-```
-
-The packager reads the completed gzip stream back, verifies every member against a SHA-256 manifest, and
-writes `faster_rcnn_final_epoch_23.tar.gz.sha256`. Download both files and verify the checksum locally.
-
-## 6. Monitor training with TensorBoard
-
-Every training entry point writes TensorBoard events by default. The logs are kept below the configured
-reports directory, so a Kaggle run using `config.kaggle.yaml` writes to:
+Every successful full-training command creates both files under `artifacts/`:
 
 ```text
-/kaggle/working/aeroinspect/reports/tensorboard/
-  smoke/
-    deformable_detr/
-    faster_rcnn/
-    mmr_real/
-    patchcore/
-    mmr_bladesynth/
-  full/
-    deformable_detr/
-    faster_rcnn/
-    mmr_real/
-    patchcore/
-    mmr_bladesynth/
+MODEL_part_N_epoch_X_of_Y.tar.gz
+MODEL_part_N_epoch_X_of_Y.tar.gz.sha256
 ```
 
-After at least one smoke or full training command has started, open the dashboard in a new notebook cell:
+A time-limited partial run includes `partial` in the name. The archive contains model/optimizer/scheduler
+state, the best checkpoint available so far, configuration, reports, and a per-file SHA-256 manifest.
+
+Before ending the notebook, choose **Save Version** with outputs enabled and download both artifact files.
+For the next session, attach the previous output as a Kaggle dataset and restore it at the repository root:
 
 ```python
-%load_ext tensorboard
-%tensorboard --logdir /kaggle/working/aeroinspect/reports/tensorboard
+!tar -xzf /kaggle/input/YOUR-PREVIOUS-OUTPUT/MODEL_ARCHIVE.tar.gz -C /kaggle/working/aeroinspect
 ```
 
-Use `progress/percent` to see completion, `train/batch_loss` and `train/epoch_loss` for optimization,
-and the `validation/*` charts for model quality. Deformable DETR and Faster R-CNN log mAP, precision,
-recall, and detector loss components. Both MMR variants log reconstruction loss and held-out-normal
-calibration. PatchCore has no gradient epochs, so it logs feature-extraction percentage, retained
-patches, memory-bank size, calibration, and final evaluation metrics.
+Then run the same part again if it was partial, or the next quarter if the earlier quarter completed. The
+trainer finds its standard state file automatically. Never start part 2/3/4 from only deployment weights;
+the resumable state is required.
 
-TensorBoard progress is not an accuracy score. Final comparisons still come from
-`reports/model_comparison.json` after the frozen test evaluation.
+## 7. Evaluate after every model is complete
 
-## 7. Smoke-test, train, and evaluate
-
-Run each stage in a separate notebook cell:
+In the evaluation notebook, attach and extract the final archive from all seven runs so every checkpoint
+is present together under `checkpoints/`. Then run:
 
 ```python
-!python scripts/kaggle_train_all.py --stage smoke --config config.yaml
-!python scripts/kaggle_train_all.py --stage full --config config.yaml
 !python scripts/kaggle_train_all.py --stage evaluate --config config.yaml
 ```
 
-The smoke and full stages run the four primary models and then the separately named BladeSynth MMR
-experiment. This means MMR is trained twice by design and requires additional Kaggle GPU time; the two
-checkpoints and metric directories never overwrite each other.
+Compare aircraft models using frozen-test mAP@50:95, mAP@50, recall, and missed-defect rate. Compare engine
+models using image AUROC, image average precision, pixel AUROC, AUPRO, false-alarm rate, and missed-anomaly
+rate. Training loss alone does not select the winner.
 
-Smoke artifacts are isolated under `checkpoints/smoke/` and `reports/smoke/`; they never replace full
-weights or metrics. If CUDA runs out of memory, reduce the relevant `batch_size` in `config.yaml`.
+`reports/model_selection.json` ranks aircraft and engine models separately and records the recommended
+winner and selection rule. It never compares aircraft mAP directly with engine AUROC.
 
-If a Kaggle session stops, resume the affected gradient-trained model with its saved state:
-
-```python
-!python scripts/train_aircraft.py --mode full --config config.yaml --resume checkpoints/aircraft_training_state.pt
-!python scripts/train_faster_rcnn.py --mode full --config config.yaml --resume checkpoints/faster_rcnn_training_state.pt
-!python scripts/train_engine.py --mode full --variant real --config config.yaml --resume checkpoints/engine_training_state.pt
-!python scripts/train_engine.py --mode full --variant bladesynth --config config.yaml --resume checkpoints/engine_bladesynth_training_state.pt
-```
-
-PatchCore fitting is deterministic and should be rerun instead of resumed.
-
-### Reliable short Kaggle runs
-
-Kaggle draft sessions can end before a long detector run finishes. Do not repeat completed work. The
-aircraft trainer can intentionally finish a short, resumable chunk after an **absolute** epoch number:
-
-```python
-# First saved chunk: epochs 1 through 8 (including the three AGDD epochs).
-!python scripts/train_aircraft.py --mode full --config config.kaggle.yaml --stop-after-epoch 8
-
-# After attaching the saved output checkpoint in a later Kaggle session, continue through epoch 16.
-!python scripts/train_aircraft.py --mode full --config config.kaggle.yaml \
-  --resume /kaggle/input/YOUR-SAVED-CHECKPOINTS/aircraft_training_state.pt \
-  --stop-after-epoch 16
-```
-
-After every completed chunk, choose **Save Version** with outputs enabled. Attach that version's output
-or upload the checkpoint as a private Kaggle dataset before the next chunk. Never close a draft session
-until its `checkpoints/aircraft_training_state.pt` has been preserved outside `/kaggle/working`.
-
-The two other gradient-trained model families use the same absolute-epoch flag:
-
-```python
-!python scripts/train_faster_rcnn.py --mode full --config config.kaggle.yaml --stop-after-epoch 6
-!python scripts/train_engine.py --mode full --variant real --config config.kaggle.yaml --stop-after-epoch 6
-!python scripts/train_engine.py --mode full --variant bladesynth --config config.kaggle.yaml --stop-after-epoch 6
-```
-
-Resume each model only from its matching state file and variant. PatchCore is a single deterministic fit,
-not an epoch-trained model, so it should be run once and does not accept either chunk or resume flags.
-
-## 8. Preserve outputs
-
-Before the Kaggle session ends, choose **Save Version** with outputs enabled or download:
-
-```text
-checkpoints/
-reports/
-```
-
-`reports/model_comparison.json` contains the final four-model comparison. The repository ships with no
-fabricated metrics or trained weights.
+Only after this comparison should `aircraft.checkpoint` point to the winning candidate. Keep the baseline
+results in the project because they demonstrate that the transformer choice was measured rather than
+assumed.

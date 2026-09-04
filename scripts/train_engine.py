@@ -6,6 +6,7 @@ import argparse
 import json
 import random
 import sys
+import time
 from pathlib import Path
 
 import numpy as np
@@ -14,7 +15,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from scripts.train_aircraft import resolve_epoch_window
+from scripts.train_aircraft import resolve_epoch_window, warmup_cosine_multiplier
 from src import load_config
 from src.data import (
     AeBADDataset,
@@ -25,12 +26,16 @@ from src.data import (
 )
 from src.engine_model import MaskedMultiScaleReconstruction
 from src.evaluation import evaluate_engine_predictions
+from src.training_artifacts import artifact_output_path, create_training_archive
+from src.training_chunks import SessionTimeGuard, boundary_for_part, training_boundaries
 from src.training_monitor import (
     create_tensorboard_writer,
     finish_tensorboard,
     log_epoch_progress,
     log_numeric_metrics,
 )
+
+SESSION_STARTED = time.monotonic()
 
 
 def seed_everything(seed: int) -> None:
@@ -58,6 +63,8 @@ def main() -> int:
     )
     parser.add_argument("--config", default="config.yaml")
     parser.add_argument("--resume", default=None)
+    parser.add_argument("--quarter", type=int, default=None)
+    parser.add_argument("--max-session-hours", type=float, default=None)
     parser.add_argument(
         "--stop-after-epoch",
         type=int,
@@ -147,7 +154,30 @@ def main() -> int:
         else 0
     )
     total_epochs = auxiliary_epochs + main_epochs
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, max(1, total_epochs))
+    training_config = config["training"]
+    boundaries = training_boundaries(
+        main_epochs,
+        auxiliary_epochs=auxiliary_epochs,
+        quarter_count=int(training_config.get("quarter_count", 4)),
+        one_go_max_epochs=int(training_config.get("one_go_max_epochs", 20)),
+    )
+    if args.quarter is not None and args.stop_after_epoch is not None:
+        parser.error("Use either --quarter or --stop-after-epoch, not both.")
+    try:
+        planned_stop_epoch = (
+            args.stop_after_epoch
+            if args.stop_after_epoch is not None
+            else boundary_for_part(boundaries, args.quarter)
+        )
+    except ValueError as exc:
+        parser.error(str(exc))
+    warmup_epochs = 0 if args.mode == "smoke" else int(engine.get("warmup_epochs", 0))
+    scheduler = torch.optim.lr_scheduler.LambdaLR(
+        optimizer,
+        lr_lambda=lambda epoch: warmup_cosine_multiplier(
+            epoch, warmup_epochs=warmup_epochs, total_epochs=total_epochs
+        ),
+    )
     amp_enabled = bool(config["training"]["mixed_precision"]) and model.device.type == "cuda"
     scaler = torch.amp.GradScaler("cuda", enabled=amp_enabled)
     checkpoint_root = Path(config["paths"]["checkpoints"])
@@ -157,10 +187,38 @@ def main() -> int:
         if args.mode == "smoke"
         else f"engine{variant_suffix}_training_state.pt"
     )
+    checkpoint_destination = (
+        checkpoint_root / f"smoke/engine{variant_suffix}_best.pt"
+        if args.mode == "smoke"
+        else Path(
+            engine["checkpoint"]
+            if args.variant == "real"
+            else engine["bladesynth_checkpoint"]
+        )
+    )
+    evaluation_root = (
+        Path(config["paths"]["reports"])
+        if args.variant == "real"
+        else Path(config["paths"]["reports"]) / "experiments/bladesynth_mmr"
+    )
+    artifact_report_sources = (
+        [evaluation_root]
+        if args.variant == "bladesynth"
+        else [
+            evaluation_root / "engine_metrics.json",
+            evaluation_root / "engine_domain_metrics.csv",
+            evaluation_root / "engine_examples",
+        ]
+    )
     start_epoch = 0
     global_step = 0
-    if args.resume:
-        checkpoint = torch.load(args.resume, map_location=model.device, weights_only=False)
+    resume_path = Path(args.resume) if args.resume else None
+    if resume_path is None and args.quarter is not None and training_state.is_file():
+        resume_path = training_state
+    if args.quarter is not None and args.quarter > 1 and resume_path is None:
+        parser.error(f"Part {args.quarter} requires the previous state at {training_state}.")
+    if resume_path is not None:
+        checkpoint = torch.load(resume_path, map_location=model.device, weights_only=False)
         model.load_state_dict(checkpoint["state_dict"])
         optimizer.load_state_dict(checkpoint["optimizer"])
         scheduler.load_state_dict(checkpoint["scheduler"])
@@ -168,17 +226,36 @@ def main() -> int:
             scaler.load_state_dict(checkpoint["scaler"])
         start_epoch = int(checkpoint["epoch"]) + 1
         global_step = int(checkpoint.get("global_step", 0))
+    if args.quarter is not None and args.quarter > 1:
+        required_completed = boundaries[args.quarter - 2]
+        if start_epoch < required_completed:
+            parser.error(
+                f"Part {args.quarter - 1} is incomplete: state has {start_epoch} completed "
+                f"epochs but requires {required_completed}."
+            )
     try:
         epoch_window = resolve_epoch_window(
             start_epoch=start_epoch,
             total_epochs=total_epochs,
-            stop_after_epoch=args.stop_after_epoch,
+            stop_after_epoch=planned_stop_epoch,
         )
     except ValueError as exc:
         parser.error(str(exc))
     model_log_name = "mmr_real" if args.variant == "real" else "mmr_bladesynth"
     writer, _ = create_tensorboard_writer(config, model_log_name, args.mode)
+    time_guard = SessionTimeGuard(
+        max_session_hours=float(
+            args.max_session_hours or training_config.get("max_session_hours", 11.0)
+        ),
+        packaging_reserve_minutes=float(
+            training_config.get("artifact_reserve_minutes", 45)
+        ),
+        started_at=SESSION_STARTED,
+    )
+    completed_epochs = start_epoch
+    stopped_for_time = False
     for epoch in epoch_window:
+        epoch_started = time.monotonic()
         phase = "auxiliary_pretraining" if epoch < auxiliary_epochs else "aebad_s_finetuning"
         active_loader = auxiliary_loader if phase == "auxiliary_pretraining" else train_loader
         if active_loader is None:
@@ -205,6 +282,11 @@ def main() -> int:
             if args.mode == "smoke":
                 break
         scheduler.step()
+        time_guard.record_epoch(time.monotonic() - epoch_started)
+        completed_epochs = epoch + 1
+        stopped_for_time = time_guard.should_stop_before_next_epoch(
+            completed_epochs, epoch_window.stop
+        )
         average_epoch_loss = epoch_loss / max(1, epoch_batches)
         if writer is not None:
             writer.add_scalar("train/epoch_loss", average_epoch_loss, epoch + 1)
@@ -218,6 +300,7 @@ def main() -> int:
         if (
             (epoch + 1) % int(config["training"].get("checkpoint_every", 1)) == 0
             or epoch + 1 == epoch_window.stop
+            or stopped_for_time
         ):
             training_state.parent.mkdir(parents=True, exist_ok=True)
             torch.save(
@@ -228,17 +311,53 @@ def main() -> int:
                     "scaler": scaler.state_dict(),
                     "epoch": epoch,
                     "global_step": global_step,
-                    "metadata": {"config": config, "thresholds_calibrated": False},
+                    "metadata": {
+                        "config": config,
+                        "thresholds_calibrated": False,
+                        "epoch_seconds": time_guard.epoch_seconds,
+                    },
                 },
                 training_state,
             )
         if writer is not None:
             writer.flush()
-    if epoch_window.stop < total_epochs:
+        if stopped_for_time:
+            print("Stopping before the next epoch to preserve Kaggle packaging time.", flush=True)
+            break
+    if completed_epochs < total_epochs:
         finish_tensorboard(writer)
+        artifact_path = artifact_output_path(
+            config["paths"].get("artifacts", "artifacts"),
+            model_log_name,
+            completed_epochs,
+            total_epochs,
+            part=args.quarter,
+            time_limited=stopped_for_time,
+        )
+        artifact = create_training_archive(
+            PROJECT_ROOT,
+            model_log_name,
+            artifact_path,
+            [
+                training_state,
+                *([checkpoint_destination] if completed_epochs >= total_epochs else []),
+                Path(config["paths"]["reports"]) / "dataset_report.json",
+                Path(args.config),
+            ],
+            run_metadata={
+                "completed_epochs": completed_epochs,
+                "total_epochs": total_epochs,
+                "part": args.quarter,
+                "time_limited": stopped_for_time,
+                "resume_state": str(training_state),
+            },
+        )
+        print(f"Downloadable artifact: {artifact['archive']['path']}")
+        print(f"SHA-256 file: {artifact['archive']['checksum_file']}")
         print(
             f"Completed a resumable MMR variant={args.variant} chunk through "
-            f"epoch {epoch_window.stop}/{total_epochs}; resume from {training_state}."
+            f"epoch {completed_epochs}/{total_epochs}; rerun the same part or resume from "
+            f"{training_state}."
         )
         return 0
     # Calibration uses held-out training normals only, never the official final test set.
@@ -291,15 +410,6 @@ def main() -> int:
         ),
         "config": config,
     }
-    checkpoint_destination = (
-        checkpoint_root / f"smoke/engine{variant_suffix}_best.pt"
-        if args.mode == "smoke"
-        else Path(
-            engine["checkpoint"]
-            if args.variant == "real"
-            else engine["bladesynth_checkpoint"]
-        )
-    )
     model.save_checkpoint(checkpoint_destination, metadata)
     torch.save(
         {
@@ -328,11 +438,6 @@ def main() -> int:
                 scores.append(prediction["anomaly_score"])
                 maps.append(prediction["anomaly_map"])
                 latencies.append(prediction["inference_time_ms"])
-        evaluation_root = (
-            Path(config["paths"]["reports"])
-            if args.variant == "real"
-            else Path(config["paths"]["reports"]) / "experiments/bladesynth_mmr"
-        )
         evaluation_metrics = evaluate_engine_predictions(
             labels,
             scores,
@@ -346,6 +451,35 @@ def main() -> int:
         )
         log_numeric_metrics(writer, "test", evaluation_metrics, total_epochs)
     finish_tensorboard(writer)
+    if args.mode == "full":
+        artifact_path = artifact_output_path(
+            config["paths"].get("artifacts", "artifacts"),
+            model_log_name,
+            completed_epochs,
+            total_epochs,
+            part=args.quarter,
+        )
+        artifact = create_training_archive(
+            PROJECT_ROOT,
+            model_log_name,
+            artifact_path,
+            [
+                training_state,
+                checkpoint_destination,
+                *artifact_report_sources,
+                Path(config["paths"]["reports"]) / "dataset_report.json",
+                Path(args.config),
+            ],
+            run_metadata={
+                "completed_epochs": completed_epochs,
+                "total_epochs": total_epochs,
+                "part": args.quarter,
+                "time_limited": False,
+                "resume_state": str(training_state),
+            },
+        )
+        print(f"Downloadable artifact: {artifact['archive']['path']}")
+        print(f"SHA-256 file: {artifact['archive']['checksum_file']}")
     print(
         f"Completed {args.mode} MMR variant={args.variant}; thresholds calibrated from "
         "held-out AeBAD-S normal validation data."

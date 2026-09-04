@@ -16,6 +16,7 @@ from src.data import (
     audit_bladesynth,
     audit_coco_source_annotations,
     audit_imdd_aircraft_subset,
+    collapse_aircraft_annotations,
     detection_sampling_weights,
     find_bladesynth_normal_paths,
     load_agdd_source,
@@ -102,6 +103,26 @@ def test_coco_conversion_preserves_traceability(tmp_path: Path) -> None:
     assert payload["annotations"][0]["source"] == "ASDD"
     assert payload["annotations"][0]["original_class_name"] == "Crack"
     assert json.loads(destination.read_text())["categories"][0]["name"] == "crack"
+
+
+def test_binary_aircraft_task_preserves_original_label_traceability() -> None:
+    record = AircraftImageRecord(
+        "panel.png",
+        200,
+        100,
+        "ASDD",
+        [
+            AircraftAnnotation(
+                [10, 20, 30, 40],
+                "surface_damage",
+                "Dent Scratch or Paint Falling",
+                "ASDD",
+            )
+        ],
+    )
+    collapse_aircraft_annotations([record], "defect")
+    assert record.annotations[0].normalized_class == "defect"
+    assert record.annotations[0].original_class == "Dent Scratch or Paint Falling"
 
 
 def test_detection_sampling_weights_upweight_rare_classes_without_overweighting_negatives(

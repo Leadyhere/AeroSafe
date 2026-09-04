@@ -18,6 +18,7 @@ paths:
   processed: data/processed
   checkpoints: checkpoints
   reports: reports
+  artifacts: artifacts
   database: data/aeroinspect.sqlite3
   inspections: data/inspections
 
@@ -32,6 +33,11 @@ aircraft_labels:
 
 dataset:
   split: {train: 0.70, validation: 0.15, test: 0.15}
+  # The public sources use overlapping class definitions (for example the
+  # broad ASDD surface-damage label overlaps dent, scratch, and paint damage).
+  # New experiments first solve the defensible task: localize any defect.
+  aircraft_task: binary
+  binary_defect_label: defect
   near_duplicate_hamming: 6
   corrosion_min_examples: 30
   class_balance_max_sampling_weight: 4.0
@@ -39,9 +45,29 @@ dataset:
   require_review_marker: true
 
 aircraft:
+  # The deployed checkpoint remains unchanged until a candidate wins on the
+  # frozen test set. Candidate runs never overwrite it.
   pretrained_model: SenseTime/deformable-detr
   checkpoint: checkpoints/aircraft_best
-  epochs: 30
+  primary_transformer: rt_detr_v2
+  transformer_candidates:
+    deformable_detr:
+      pretrained_model: SenseTime/deformable-detr
+      checkpoint: checkpoints/aircraft_candidates/deformable_detr
+      image_size: 800
+    rt_detr:
+      pretrained_model: PekingU/rtdetr_r50vd
+      checkpoint: checkpoints/aircraft_candidates/rt_detr
+      image_size: 640
+    rt_detr_v2:
+      pretrained_model: PekingU/rtdetr_v2_r50vd
+      checkpoint: checkpoints/aircraft_candidates/rt_detr_v2
+      image_size: 640
+  # Twenty fine-tuning epochs are enough for the first fair pretrained-model
+  # comparison; non-improving models should not consume another 40 epochs.
+  epochs: 20
+  warmup_epochs: 2
+  validation_interval: 5
   batch_size: 2
   learning_rate: 0.00002
   backbone_learning_rate: 0.000002
@@ -68,12 +94,17 @@ engine:
   image_size: 224
   mask_ratio: 0.40
   inference_masks: 1
-  epochs: 50
-  batch_size: 8
-  learning_rate: 0.0001
-  weight_decay: 0.0001
-  validation_fraction: 0.10
-  normal_threshold_quantile: 0.995
+  # Match the published AeBAD-S MMR optimization recipe before comparing
+  # alternative anomaly transformers.
+  epochs: 200
+  warmup_epochs: 50
+  batch_size: 16
+  learning_rate: 0.001
+  weight_decay: 0.05
+  validation_fraction: 0.20
+  # 0.995 on the previous 52-image validation set effectively selected its
+  # maximum score and caused very low sensitivity.
+  normal_threshold_quantile: 0.95
   anomaly_threshold: null
   pixel_threshold: null
   auxiliary_pretrain_epochs: 5
@@ -84,6 +115,7 @@ baselines:
   faster_rcnn:
     checkpoint: checkpoints/faster_rcnn_best.pt
     epochs: 20
+    validation_interval: 5
     batch_size: 2
     learning_rate: 0.005
     momentum: 0.9
@@ -91,7 +123,7 @@ baselines:
   patchcore:
     checkpoint: checkpoints/patchcore_best.pt
     batch_size: 8
-    coreset_fraction: 0.01
+    coreset_fraction: 0.10
     max_patches: 50000
     projection_dim: 128
 
@@ -100,6 +132,12 @@ training:
   num_workers: 4
   mixed_precision: true
   checkpoint_every: 1
+  # Training stops between epochs early enough to package a resumable archive
+  # before Kaggle's 12-hour session limit.
+  max_session_hours: 11.0
+  artifact_reserve_minutes: 45
+  quarter_count: 4
+  one_go_max_epochs: 20
   tensorboard: true
   # Null stores runs under <reports>/tensorboard/{smoke|full}/<model>.
   tensorboard_log_dir: null

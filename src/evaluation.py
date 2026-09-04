@@ -15,7 +15,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
-from sklearn.metrics import roc_auc_score
+from sklearn.metrics import average_precision_score, roc_auc_score
 
 
 def bbox_iou_xywh(left: Sequence[float], right: Sequence[float]) -> float:
@@ -307,6 +307,21 @@ def safe_auroc(labels: Sequence[int], scores: Sequence[float]) -> float | None:
     return float(roc_auc_score(labels_array, scores_array))
 
 
+def safe_average_precision(
+    labels: Sequence[int], scores: Sequence[float]
+) -> float | None:
+    """Return anomaly average precision without inventing a one-class result."""
+    labels_array = np.asarray(labels, dtype=int)
+    scores_array = np.asarray(scores, dtype=float)
+    if len(labels_array) != len(scores_array) or not len(labels_array):
+        raise ValueError("Labels and scores must be non-empty and have equal lengths.")
+    if not np.isfinite(scores_array).all():
+        raise ValueError("Anomaly scores contain NaN or infinite values.")
+    if len(np.unique(labels_array)) < 2:
+        return None
+    return float(average_precision_score(labels_array, scores_array))
+
+
 def compute_aupro(
     masks: np.ndarray, anomaly_maps: np.ndarray, *, max_fpr: float = 0.30, thresholds: int = 200
 ) -> float | None:
@@ -358,6 +373,7 @@ def evaluate_engine_predictions(
     masks_array = np.asarray(masks).astype(bool)
     maps_array = np.asarray(anomaly_maps, dtype=float)
     image_auroc = safe_auroc(labels, scores)
+    image_average_precision = safe_average_precision(labels, scores)
     pixel_auroc = safe_auroc(masks_array.reshape(-1).astype(int), maps_array.reshape(-1))
     aupro = compute_aupro(masks_array, maps_array)
     dice = iou = None
@@ -404,6 +420,7 @@ def evaluate_engine_predictions(
         )
     metrics = {
         "image_auroc": image_auroc,
+        "image_average_precision": image_average_precision,
         "pixel_auroc": pixel_auroc,
         "aupro": aupro,
         "dice": dice,

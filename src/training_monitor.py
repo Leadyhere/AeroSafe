@@ -4,9 +4,10 @@ from __future__ import annotations
 
 import json
 import math
+from collections.abc import Mapping
 from numbers import Real
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any
 
 
 def create_tensorboard_writer(

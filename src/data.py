@@ -60,6 +60,21 @@ class AircraftImageRecord:
     fixed_split: str | None = None
 
 
+def collapse_aircraft_annotations(
+    records: Sequence[AircraftImageRecord], label: str = "defect"
+) -> None:
+    """Collapse overlapping public taxonomies into one defensible defect class.
+
+    ``original_class`` and ``source`` remain unchanged so every exported box can
+    still be traced back to the source annotation.
+    """
+    if not str(label).strip():
+        raise ValueError("Binary aircraft defect label must not be empty.")
+    for record in records:
+        for annotation in record.annotations:
+            annotation.normalized_class = str(label)
+
+
 LEAKAGE_ID_FIELDS = (
     "aircraft_id",
     "tail_number",
@@ -984,19 +999,29 @@ def prepare_aircraft_data(config: Mapping[str, Any]) -> dict[str, Any]:
         if path not in invalid_paths and path not in exact_removed
     ]
 
-    class_counts = Counter(
+    original_class_counts = Counter(
         annotation.normalized_class for record in records for annotation in record.annotations
     )
-    corrosion_minimum = int(dataset_config.get("corrosion_min_examples", 30))
-    categories = [name for name in labels if name != "corrosion"]
-    corrosion_enabled = class_counts.get("corrosion", 0) >= corrosion_minimum
-    if corrosion_enabled:
-        categories.append("corrosion")
+    task_mode = str(dataset_config.get("aircraft_task", "multiclass")).strip().lower()
+    if task_mode not in {"binary", "multiclass"}:
+        raise ValueError("dataset.aircraft_task must be either 'binary' or 'multiclass'.")
+    if task_mode == "binary":
+        binary_label = str(dataset_config.get("binary_defect_label", "defect")).strip()
+        collapse_aircraft_annotations(records, binary_label)
+        categories = [binary_label]
+        corrosion_enabled = None
     else:
-        for record in records:
-            record.annotations = [
-                annotation for annotation in record.annotations if annotation.normalized_class != "corrosion"
-            ]
+        corrosion_minimum = int(dataset_config.get("corrosion_min_examples", 30))
+        categories = [name for name in labels if name != "corrosion"]
+        corrosion_enabled = original_class_counts.get("corrosion", 0) >= corrosion_minimum
+        if corrosion_enabled:
+            categories.append("corrosion")
+        else:
+            for record in records:
+                record.annotations = [
+                    annotation for annotation in record.annotations
+                    if annotation.normalized_class != "corrosion"
+                ]
     # Images with no compatible labels remain valid negative detector examples.
     record_paths = [str(Path(record.path).resolve()) for record in records]
     leakage_groups = merge_leakage_groups(record_paths, duplicate.groups, records_by_path)
@@ -1025,6 +1050,9 @@ def prepare_aircraft_data(config: Mapping[str, Any]) -> dict[str, Any]:
         coco_outputs[split] = str(output_path)
 
     agdd_records = load_agdd_source(paths["agdd"], labels)
+    if task_mode == "binary":
+        for split_records in agdd_records.values():
+            collapse_aircraft_annotations(split_records, categories[0])
     agdd_paths = [record.path for split_records in agdd_records.values() for record in split_records]
     agdd_duplicates = analyze_duplicates(
         agdd_paths,
@@ -1072,6 +1100,8 @@ def prepare_aircraft_data(config: Mapping[str, Any]) -> dict[str, Any]:
         "exact_duplicate_resolution": (
             "Kept one copy with the most specific/rich annotation set; aircraftsurface1 wins exact ties."
         ),
+        "task_mode": task_mode,
+        "original_class_distribution": dict(sorted(original_class_counts.items())),
         "near_duplicates": len(duplicate.near_pairs),
         "derivative_pairs": len(duplicate.derivative_pairs),
         "removed_duplicates": len(exact_removed),
@@ -1527,6 +1557,16 @@ def prepare_datasets(
             },
         }
     destination = Path(report_path or Path(config["paths"]["reports"]) / "dataset_report.json")
+    if scope != "all" and destination.is_file():
+        try:
+            previous_report = json.loads(destination.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            previous_report = {}
+        if isinstance(previous_report, dict):
+            merged_report = {**previous_report, **report}
+            if "aircraft" in merged_report and "engine" in merged_report:
+                merged_report["scope"] = "all"
+            report = merged_report
     destination.parent.mkdir(parents=True, exist_ok=True)
     destination.write_text(json.dumps(report, indent=2), encoding="utf-8")
     return report

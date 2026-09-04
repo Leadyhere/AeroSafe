@@ -3,14 +3,21 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
+from scripts.evaluate import metric_rank_value
 from src.evaluation import (
     bbox_iou_xywh,
     compute_aupro,
     detection_calibration_error,
     detection_prf,
     safe_auroc,
+    safe_average_precision,
     select_detection_threshold,
 )
+
+
+def test_metric_rank_value_preserves_real_zero():
+    assert metric_rank_value({"score": 0.0}, "score") == 0.0
+    assert metric_rank_value({"score": None}, "score") == -1.0
 
 
 def test_bbox_iou_and_detection_prf() -> None:
@@ -25,6 +32,8 @@ def test_bbox_iou_and_detection_prf() -> None:
 
 def test_undefined_auroc_is_none_and_nonfinite_rejected() -> None:
     assert safe_auroc([0, 0], [0.1, 0.2]) is None
+    assert safe_average_precision([0, 0], [0.1, 0.2]) is None
+    assert safe_average_precision([0, 1], [0.1, 0.9]) == 1.0
     with pytest.raises(ValueError, match="NaN"):
         safe_auroc([0, 1], [0.1, np.nan])
 

@@ -2,13 +2,13 @@
 
 Deep Learning Based Aircraft Structural and Aero-Engine Visual Defect Inspection System
 
-AeroInspect is a focused, end-to-end computer-vision project with two deployment models and two
-scientific comparison baselines:
+AeroInspect is a focused, end-to-end computer-vision project with transformer-first aircraft detection,
+normality-based engine anomaly detection, and scientific baselines:
 
-- **Deformable DETR** for multi-class aircraft-surface object detection.
+- **RT-DETR v2, RT-DETR, and Deformable DETR** candidates for binary aircraft-defect localization.
 - **MMR (Masked Multi-scale Reconstruction)** for normality-based aero-engine blade anomaly detection and
   pixel localization.
-- **Faster R-CNN ResNet50-FPN** trained on the identical aircraft split as the detector baseline.
+- **Faster R-CNN ResNet50-FPN** trained on the identical binary aircraft split as the detector baseline.
 - **PatchCore** fitted on the identical AeBAD-S normal split as the anomaly baseline.
 
 This repository contains dataset engineering, leakage-resistant splits, model training, evaluation,
@@ -29,7 +29,8 @@ anomaly into a closed class list.
 
 ## Objectives
 
-- Detect and classify multiple aircraft defects with boxes and confidence scores.
+- Detect aircraft defects with boxes and confidence scores. Original source classes remain in the data
+  report for later taxonomy work, but inconsistent cross-dataset names are not used as training targets.
 - Detect aero-engine blade anomalies with image scores and pixel heatmaps.
 - Validate input quality and preserve dataset split integrity.
 - Support single and controlled batch inspection, persisted history, and downloadable reports.
@@ -41,8 +42,8 @@ anomaly into a closed class list.
 flowchart TD
     A[Inspection image] --> B[Deterministic quality checks]
     B --> C{Inspection type}
-    C -->|Aircraft exterior| D[Pretrained Deformable DETR]
-    D --> E[Boxes + classes + confidence]
+    C -->|Aircraft exterior| D[Selected RT-DETR-family transformer]
+    D --> E[Defect boxes + confidence]
     C -->|Engine blade| F[MMR normal-feature reconstruction]
     F --> G[Anomaly score + pixel heatmap]
     E --> H[Annotated result]
@@ -90,7 +91,8 @@ The observed local counts, anomalies, and corrective actions are documented in
 
 1. Decode and validate supported images.
 2. Parse all Roboflow COCO split files plus supported Pascal VOC, YOLO, or LabelMe annotations.
-3. Normalize aliases while retaining original source/class fields.
+3. Normalize aliases, retain original source/class fields for auditing, and collapse aircraft targets to
+   one `defect` class by default.
 4. Validate AGDD rectangular boxes and create a separate auxiliary-pretraining split.
 5. Audit IMDD CSV/image agreement without inventing localization boxes; include a separate reviewed
    IMDD localization export only when its directory contains a `REVIEWED` marker.
@@ -104,14 +106,15 @@ The observed local counts, anomalies, and corrective actions are documented in
 12. Validate AeBAD-S masks, sample AeBAD-V normal frames per video, and accept only BladeSynth Normal images.
 13. Export train/validation/test COCO files and `reports/dataset_report.json` from observed data.
 
-Full aircraft training uses the same capped inverse-square-root image sampler for both detectors to
-reduce class imbalance without making rare examples dominate every epoch.
+Full aircraft training compares three transformer detectors on the exact same grouped binary split. This
+first asks the reliable question, “where is a defect?”, without forcing incompatible public-dataset names
+into a noisy multi-class target. Faster R-CNN remains the non-transformer control.
 
 ASDD and aircraftsurface1 are re-split as a combined cleaned corpus after AGDD auxiliary pretraining.
 AeBAD-S keeps its official test boundary; a deterministic subset of real normal training images is held
 out only for threshold calibration. The primary MMR remains AeBAD-S-only. A separately checkpointed MMR
 experiment uses sampled normal AeBAD-V frames and only the explicit BladeSynth Normal class before real
-AeBAD-S fine-tuning; its metrics remain outside the four-model comparison. PatchCore also stays
+AeBAD-S fine-tuning; its metrics remain outside the main model comparison. PatchCore also stays
 AeBAD-S-only as a clean real-data baseline.
 
 IMDD can be upgraded with model-assisted proposals after the first detector is trained:
@@ -165,18 +168,16 @@ The command also creates a `.sha256` sidecar. A browser download is complete onl
 matches that sidecar; a filename appearing in Downloads is not sufficient evidence. Add
 `--deployment-only` only when optimizer/scheduler state is intentionally unnecessary.
 
-## Deformable DETR
+## Aircraft transformer candidates
 
-The aircraft wrapper uses
-`transformers.DeformableDetrForObjectDetection.from_pretrained("SenseTime/deformable-detr")` and replaces
-only the task classification head for the normalized taxonomy. The original convolutional backbone,
-multi-scale features, positional embeddings, deformable attention, encoder/decoder, object queries,
-Hungarian matching, classification loss, L1 box loss, and generalized-IoU loss remain the architecture's
-native implementation.
+The shared aircraft wrapper uses Hugging Face `AutoModelForObjectDetection` and evaluates three pretrained
+candidates configured in `config.yaml`: RT-DETR v2, RT-DETR, and Deformable DETR. Each gets its own
+checkpoint, training state, TensorBoard directory, and frozen-test report. Candidate weights never replace
+the deployed checkpoint automatically; promotion happens only after a fair held-out comparison.
 
-Traditional DETR globally attends over feature maps and is slower to converge, with limited feature-map
-resolution for small objects. Deformable attention samples a sparse set of relevant points across scales,
-which is useful when cracks, scratches, paint loss, or missing fasteners occupy a small image region.
+Training uses candidate-appropriate 640- or 800-pixel inputs, pretrained weights, AdamW, warmup followed by
+cosine decay, mixed precision on CUDA, and candidate-specific resume files. The binary task is deliberate:
+localization quality must be proved before rebuilding a trustworthy defect taxonomy.
 
 ## MMR
 
@@ -232,6 +233,7 @@ paths:
   processed: /kaggle/working/aeroinspect/data/processed
   checkpoints: /kaggle/working/aeroinspect/checkpoints
   reports: /kaggle/working/aeroinspect/reports
+  artifacts: /kaggle/working/aeroinspect/artifacts
 ```
 
 The complete beginner-friendly procedure is in [KAGGLE_TRAINING.md](KAGGLE_TRAINING.md). In short, run:
@@ -239,29 +241,24 @@ The complete beginner-friendly procedure is in [KAGGLE_TRAINING.md](KAGGLE_TRAIN
 ```bash
 cd /kaggle/working/aeroinspect
 pip install -q -r requirements.txt
-python scripts/prepare_data.py
+python scripts/kaggle_train_all.py --stage prepare --config config.yaml
+python scripts/kaggle_train_all.py --stage smoke --config config.yaml
+python scripts/kaggle_train_all.py --stage plan --config config.yaml
 
-python scripts/train_aircraft.py --mode smoke
-python scripts/train_faster_rcnn.py --mode smoke
-python scripts/train_aircraft.py --mode full
-python scripts/train_faster_rcnn.py --mode full
-
-python scripts/train_engine.py --mode smoke --variant real
-python scripts/train_patchcore.py --mode smoke
-python scripts/train_engine.py --mode smoke --variant bladesynth
-python scripts/train_engine.py --mode full --variant real
-python scripts/train_patchcore.py --mode full
-python scripts/train_engine.py --mode full --variant bladesynth
-python scripts/evaluate.py --target all
+# Run one model/part per Kaggle session. Example:
+python scripts/kaggle_train_all.py --stage train --model rt_detr_v2 --quarter 1 --config config.yaml
+python scripts/kaggle_train_all.py --stage train --model mmr_real --quarter 1 --config config.yaml
 ```
 
 Smoke mode uses a tiny **real** subset and executes loading, collation, pretrained initialization, model
 fitting or a backward update, checkpoint save, and evaluation code. Smoke artifacts are isolated from
 full checkpoints and final metrics. It does not invent smoke metrics. Full mode
 supports AdamW, separate detector backbone learning rate, cosine scheduling, mixed precision on CUDA,
-gradient clipping, checkpoint state, and resume with `--resume checkpoints/*_training_state.pt`.
+gradient clipping, automatic resume, and an adaptive 11-hour time guard. Every full-training exit writes a
+verified resumable `.tar.gz` and `.sha256` file under `artifacts/`. Long MMR runs use four quarter commands;
+20-epoch models use one logical command and stop/resume automatically if measured runtime requires it.
 
-Download `checkpoints/` and `reports/` from the Kaggle output after training. Do not commit the weights.
+Download `artifacts/` after every Kaggle session. Do not commit the weights.
 
 After all model development is frozen, an optional IISc external-only run is available and writes to a
 separate directory:
@@ -276,9 +273,17 @@ python scripts/evaluate.py --target external-aircraft
 python scripts/evaluate.py --target all
 ```
 
+To compare only the three transformer candidates, run
+`python scripts/evaluate.py --target aircraft-transformers`. Select the winner by frozen-test mAP and
+missed-defect rate, not by training loss alone.
+
+The complete evaluation also writes `reports/model_selection.json`, with separate aircraft and engine
+rankings so unrelated metrics are never mixed.
+
 Aircraft output:
 
-- `reports/aircraft_metrics.json`: mAP@50, mAP@50:95, small/medium/large AP, P/R/F1,
+- `reports/aircraft_transformers/<candidate>/aircraft_metrics.json`: candidate mAP@50, mAP@50:95,
+  small/medium/large AP, P/R/F1,
   missed-defect rate, validation-selected deployment threshold, calibration error, and latency.
 - `reports/aircraft_per_class.csv`: AP, precision, recall, and missed-defect rate by class.
 - `reports/aircraft_predictions/predictions.json`: decoded final predictions.
@@ -286,11 +291,12 @@ Aircraft output:
 
 Engine output:
 
-- `reports/engine_metrics.json`: image AUROC, pixel AUROC, AUPRO, thresholded Dice/IoU, false alarms,
+- `reports/engine_metrics.json`: image AUROC, image average precision, pixel AUROC, AUPRO,
+  thresholded Dice/IoU, false alarms,
   missed anomalies, sensitivity/specificity, balanced accuracy, and latency.
 - `reports/engine_domain_metrics.csv`: AUROC, false-alarm rate, and missed-anomaly rate by AeBAD-S domain.
 - `reports/tensorboard/`: live smoke/full training progress, losses, learning rates, validation metrics,
-  threshold calibration, and PatchCore fitting progress for all five training runs.
+  threshold calibration, and PatchCore fitting progress for all seven training runs.
 
 Undefined metrics (for example AUROC on a one-class subset) are stored as `null`, never coerced into a
 convincing number. The performance page displays “This model has not been evaluated yet” when files are
@@ -349,7 +355,7 @@ no-finding behavior, missing-threshold failure, SQLite persistence, empty dashbo
 
 ## Future work
 
-After the four-model real-data comparison is trained and validated: frozen IISc external evaluation,
+After the real-data model comparison is trained and validated: frozen IISc external evaluation,
 BladeSynth-only ablation, borescope video, additional components, and edge deployment are reasonable
 extensions.
 
@@ -360,7 +366,7 @@ app.py                  Streamlit application
 config.yaml             Single configuration source
 src/data.py             Dataset adapters, normalization, grouping, COCO export
 src/preprocessing.py    Loading, quality, augmentation, hashes
-src/aircraft_model.py   Deformable DETR transfer-learning wrapper
+src/aircraft_model.py   Shared Hugging Face transformer detector wrapper
 src/engine_model.py     Compact MMR implementation
 src/inference.py        Inspection and visualization APIs
 src/evaluation.py       COCO and anomaly metrics

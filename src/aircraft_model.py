@@ -1,7 +1,8 @@
-"""Deformable DETR transfer-learning wrapper for aircraft defect detection."""
+"""Shared Hugging Face transformer wrapper for aircraft defect detection."""
 
 from __future__ import annotations
 
+import inspect
 import json
 import time
 from collections.abc import Mapping, Sequence
@@ -20,7 +21,7 @@ def select_device():
 
 
 class AircraftDetector:
-    """Thin, architecture-preserving wrapper around Hugging Face Deformable DETR."""
+    """Common wrapper for Hugging Face transformer object detectors."""
 
     model_name = "deformable_detr"
 
@@ -29,11 +30,13 @@ class AircraftDetector:
         labels: Sequence[str],
         *,
         pretrained_model: str = "SenseTime/deformable-detr",
+        architecture: str = "deformable_detr",
+        image_size: int | None = None,
         device: Any = None,
         confidence_threshold: float = 0.5,
         local_files_only: bool = False,
     ) -> None:
-        from transformers import DeformableDetrForObjectDetection, DeformableDetrImageProcessor
+        from transformers import AutoImageProcessor, AutoModelForObjectDetection
 
         if not labels or len(set(labels)) != len(labels):
             raise ValueError("Aircraft detector labels must be a non-empty unique sequence.")
@@ -43,12 +46,21 @@ class AircraftDetector:
         self.id2label = {index: label for index, label in enumerate(self.labels)}
         self.label2id = {label: index for index, label in self.id2label.items()}
         self.pretrained_model = pretrained_model
+        self.architecture = str(architecture)
+        self.model_name = self.architecture
         self.device = device or select_device()
         self.confidence_threshold = float(confidence_threshold)
-        self.processor = DeformableDetrImageProcessor.from_pretrained(
-            pretrained_model, local_files_only=local_files_only
-        )
-        self.model = DeformableDetrForObjectDetection.from_pretrained(
+        processor_kwargs: dict[str, Any] = {"local_files_only": local_files_only}
+        if image_size is not None:
+            if self.architecture.startswith("rt_detr"):
+                processor_kwargs["size"] = {"height": int(image_size), "width": int(image_size)}
+            else:
+                processor_kwargs["size"] = {
+                    "shortest_edge": int(image_size),
+                    "longest_edge": int(image_size),
+                }
+        self.processor = AutoImageProcessor.from_pretrained(pretrained_model, **processor_kwargs)
+        self.model = AutoModelForObjectDetection.from_pretrained(
             pretrained_model,
             num_labels=len(self.labels),
             id2label=self.id2label,
@@ -59,8 +71,13 @@ class AircraftDetector:
         self.version = "untrained-transfer-head"
         self.metadata: dict[str, Any] = {}
 
-    def training_forward(self, pixel_values: Any, pixel_mask: Any, labels: list[dict[str, Any]]):
-        return self.model(pixel_values=pixel_values, pixel_mask=pixel_mask, labels=labels)
+    def training_forward(
+        self, pixel_values: Any, pixel_mask: Any | None, labels: list[dict[str, Any]]
+    ):
+        arguments = {"pixel_values": pixel_values, "labels": labels}
+        if pixel_mask is not None and "pixel_mask" in inspect.signature(self.model.forward).parameters:
+            arguments["pixel_mask"] = pixel_mask
+        return self.model(**arguments)
 
     def predict(self, image: Any, threshold: float | None = None) -> list[dict[str, Any]]:
         import torch
@@ -104,6 +121,7 @@ class AircraftDetector:
         self.processor.save_pretrained(directory)
         payload = {
             "model_name": self.model_name,
+            "architecture": self.architecture,
             "base_checkpoint": self.pretrained_model,
             "labels": self.labels,
             "confidence_threshold": self.confidence_threshold,
@@ -115,7 +133,7 @@ class AircraftDetector:
 
     @classmethod
     def load(cls, directory: str | Path, *, device: Any = None) -> AircraftDetector:
-        from transformers import DeformableDetrForObjectDetection, DeformableDetrImageProcessor
+        from transformers import AutoImageProcessor, AutoModelForObjectDetection
 
         directory = Path(directory)
         metadata_path = directory / "aeroinspect_metadata.json"
@@ -129,10 +147,12 @@ class AircraftDetector:
         instance.id2label = {index: label for index, label in enumerate(instance.labels)}
         instance.label2id = {label: index for index, label in instance.id2label.items()}
         instance.pretrained_model = str(metadata.get("base_checkpoint", directory))
+        instance.architecture = str(metadata.get("architecture", metadata.get("model_name", "deformable_detr")))
+        instance.model_name = instance.architecture
         instance.device = device or select_device()
         instance.confidence_threshold = float(metadata.get("confidence_threshold", 0.5))
-        instance.processor = DeformableDetrImageProcessor.from_pretrained(directory, local_files_only=True)
-        instance.model = DeformableDetrForObjectDetection.from_pretrained(
+        instance.processor = AutoImageProcessor.from_pretrained(directory, local_files_only=True)
+        instance.model = AutoModelForObjectDetection.from_pretrained(
             directory, local_files_only=True
         ).to(instance.device)
         instance.metadata = metadata
@@ -141,11 +161,24 @@ class AircraftDetector:
 
 
 def collate_detection_batch(batch: Sequence[Mapping[str, Any]], processor: Any) -> dict[str, Any]:
+    import torch
 
-    padded = processor.pad(images=[item["pixel_values"] for item in batch], return_tensors="pt")
+    images = [item["pixel_values"] for item in batch]
+    if images and all(image.shape == images[0].shape for image in images):
+        padded: dict[str, Any] = {"pixel_values": torch.stack(images)}
+        if "pixel_mask" in batch[0]:
+            padded["pixel_mask"] = torch.stack([item["pixel_mask"] for item in batch])
+    elif hasattr(processor, "pad"):
+        padded = processor.pad(images=images, return_tensors="pt")
+    else:
+        raise ValueError("The selected processor produced variable image sizes but cannot pad them.")
     labels = []
     for item in batch:
         labels.append(
             {key: value for key, value in item["labels"].items()}
         )
-    return {"pixel_values": padded["pixel_values"], "pixel_mask": padded["pixel_mask"], "labels": labels}
+    return {
+        "pixel_values": padded["pixel_values"],
+        "pixel_mask": padded.get("pixel_mask"),
+        "labels": labels,
+    }

@@ -126,7 +126,7 @@ def inspect_aircraft(
     if not quality["usable"]:
         raise ImageValidationError("Image is too small to analyze reliably.")
     if model is None or not hasattr(model, "predict"):
-        raise ModelNotReadyError("A trained Deformable DETR checkpoint is required for aircraft inspection.")
+        raise ModelNotReadyError("A trained transformer-detector checkpoint is required for aircraft inspection.")
     start = time.perf_counter()
     tile_config = (config or {}).get("aircraft", {}).get("tiled_inference", {})
     tiled = bool(tile_config.get("enabled", False)) and max(pil_image.size) >= int(
