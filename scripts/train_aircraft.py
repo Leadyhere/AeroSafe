@@ -22,7 +22,7 @@ from src.aircraft_model import AircraftDetector, collate_detection_batch
 from src.data import AircraftDetectionDataset, detection_sampling_weights
 from src.evaluation import evaluate_aircraft_predictions
 from src.preprocessing import build_aircraft_augmentation, load_image
-from src.training_artifacts import artifact_output_path, create_training_archive
+from src.training_artifacts import artifact_output_path, atomic_torch_save, create_training_archive
 from src.training_chunks import SessionTimeGuard, boundary_for_part, training_boundaries
 from src.training_monitor import (
     create_tensorboard_writer,
@@ -338,7 +338,10 @@ def main() -> int:
             with torch.amp.autocast("cuda", enabled=amp_enabled):
                 outputs = detector.training_forward(pixel_values, pixel_mask, targets)
                 raw_loss = outputs.loss
-                loss = raw_loss / accumulation
+                # The final accumulation group can contain fewer batches.
+                group_start = (step // accumulation) * accumulation
+                group_size = min(accumulation, len(loader) - group_start)
+                loss = raw_loss / group_size
             loss_value = float(raw_loss.detach())
             epoch_loss += loss_value
             epoch_batches += 1
@@ -415,7 +418,7 @@ def main() -> int:
             detector.confidence_threshold = float(metrics["recommended_confidence_threshold"])
             detector.save(checkpoint_destination, metadata)
         training_state.parent.mkdir(parents=True, exist_ok=True)
-        torch.save(
+        atomic_torch_save(
             {
                 "model": detector.model.state_dict(),
                 "optimizer": optimizer.state_dict(),
@@ -453,7 +456,7 @@ def main() -> int:
             artifact_path,
             [
                 training_state,
-                *([checkpoint_destination] if completed_epochs >= total_epochs else []),
+                *([checkpoint_destination] if checkpoint_destination.exists() else []),
                 reports,
                 dataset_report_path,
                 processed,

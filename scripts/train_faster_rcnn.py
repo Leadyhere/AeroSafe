@@ -21,7 +21,7 @@ from src.baselines import FasterRCNNBaseline, FasterRCNNDataset, collate_faster_
 from src.data import detection_sampling_weights
 from src.evaluation import evaluate_aircraft_predictions
 from src.preprocessing import build_aircraft_augmentation
-from src.training_artifacts import artifact_output_path, create_training_archive
+from src.training_artifacts import artifact_output_path, atomic_torch_save, create_training_archive
 from src.training_chunks import SessionTimeGuard, boundary_for_part, training_boundaries
 from src.training_monitor import (
     create_tensorboard_writer,
@@ -283,7 +283,7 @@ def main() -> int:
             model.confidence_threshold = float(metrics["recommended_confidence_threshold"])
             model.save(checkpoint_path, metadata)
         state_path.parent.mkdir(parents=True, exist_ok=True)
-        torch.save(
+        atomic_torch_save(
             {
                 "state_dict": model.model.state_dict(),
                 "optimizer": optimizer.state_dict(),
@@ -318,7 +318,7 @@ def main() -> int:
             artifact_path,
             [
                 state_path,
-                *([checkpoint_path] if completed_epochs >= total_epochs else []),
+                *([checkpoint_path] if checkpoint_path.exists() else []),
                 report_dir,
                 Path(config["paths"]["reports"]) / "dataset_report.json",
                 processed,

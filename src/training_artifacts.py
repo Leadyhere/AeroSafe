@@ -4,11 +4,23 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import tarfile
 import tempfile
 from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
+
+
+def atomic_torch_save(payload: Any, path: str | Path) -> None:
+    """Keep the previous completed checkpoint intact if saving is interrupted."""
+    import torch
+
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(path.name + ".pending")
+    torch.save(payload, temporary)
+    os.replace(temporary, path)
 
 
 def sha256_file(path: Path) -> str:

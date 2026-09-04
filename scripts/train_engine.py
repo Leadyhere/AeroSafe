@@ -26,7 +26,7 @@ from src.data import (
 )
 from src.engine_model import MaskedMultiScaleReconstruction
 from src.evaluation import evaluate_engine_predictions
-from src.training_artifacts import artifact_output_path, create_training_archive
+from src.training_artifacts import artifact_output_path, atomic_torch_save, create_training_archive
 from src.training_chunks import SessionTimeGuard, boundary_for_part, training_boundaries
 from src.training_monitor import (
     create_tensorboard_writer,
@@ -303,7 +303,7 @@ def main() -> int:
             or stopped_for_time
         ):
             training_state.parent.mkdir(parents=True, exist_ok=True)
-            torch.save(
+            atomic_torch_save(
                 {
                     "state_dict": model.state_dict(),
                     "optimizer": optimizer.state_dict(),
@@ -411,7 +411,7 @@ def main() -> int:
         "config": config,
     }
     model.save_checkpoint(checkpoint_destination, metadata)
-    torch.save(
+    atomic_torch_save(
         {
             "state_dict": model.state_dict(),
             "optimizer": optimizer.state_dict(),

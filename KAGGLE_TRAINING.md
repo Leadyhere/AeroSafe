@@ -1,5 +1,9 @@
 # Kaggle training runbook
 
+For the beginner-friendly per-friend cells, download links, and notebook-wide deadline,
+use [KAGGLE_FRIENDS.md](KAGGLE_FRIENDS.md). Its session wrapper supersedes the direct
+training commands below for notebook use.
+
 This is the complete AeroInspect training plan. It contains seven fair training runs: five
 transformer-based runs and two comparison baselines. Do not run all full models in one notebook session.
 Run one command at a time, save the Kaggle version, and download the generated archive.
@@ -20,8 +24,10 @@ session budget, leaving 45 minutes to package the result.
 | Faster R-CNN | CNN baseline | Prove whether transformers improve aircraft results | Same aircraft split | 3 + 20, one logical run | 8-16 h |
 | PatchCore | CNN baseline | Engine anomaly comparison | AeBAD-S normal images | One fit | 0.5-1.5 h |
 
-The combined estimate is roughly 49-94 T4 GPU-hours. Each individual notebook session remains under 12
-hours. A 20-epoch model is attempted in one logical run; if real measured speed makes that unsafe, it stops,
+The combined estimate is roughly 49-94 T4 GPU-hours; these are unmeasured planning estimates.
+The notebook wrapper stops its training process group at 10.5 hours from its first clock cell.
+Start that cell immediately in a fresh session. Platform shutdowns and hangs cannot be guaranteed against.
+A 20-epoch model is attempted in one logical run; if real measured speed makes that unsafe, it stops,
 archives the completed epochs, and resumes when the same command is run again.
 
 ## Dataset rules
