@@ -1,5 +1,10 @@
 # Copy-and-paste Kaggle instructions
 
+Accuracy-integrity update: read [ACCURACY_PLAN.md](ACCURACY_PLAN.md) before starting new runs.
+Use fresh states from this revision; older checkpoint recipes are rejected. Aircraft notebooks
+should attach `aerosafe-group-manifest-v2` alongside the original datasets. Final-test evaluation
+is now explicitly locked during model development. The older aabe32aa revision lacks these changes.
+
 Each friend uses their own notebook and one model. Use the same dataset versions across
 friends. Every code block below is a separate notebook cell. Run cells in order and stop
 on errors. Enable a GPU and Internet before starting. Start a fresh session for every part;

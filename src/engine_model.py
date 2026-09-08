@@ -253,7 +253,9 @@ class MaskedMultiScaleReconstruction(nn.Module):
 
         transform = v2.Compose(
             [
-                v2.Resize((self.image_size, self.image_size), antialias=True),
+                # Match AeBADDataset validation geometry used for calibration.
+                v2.Resize((round(self.image_size * 256 / 224),) * 2, antialias=True),
+                v2.CenterCrop(self.image_size),
                 v2.ToImage(),
                 v2.ToDtype(torch.float32, scale=True),
                 v2.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),

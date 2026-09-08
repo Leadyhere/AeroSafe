@@ -20,6 +20,19 @@ from src.baselines import FasterRCNNBaseline, PatchCoreBaseline
 from src.data import AeBADDataset, load_aircraft_source, records_to_coco
 from src.engine_model import MaskedMultiScaleReconstruction
 from src.evaluation import evaluate_aircraft_predictions, evaluate_engine_predictions
+from src.experiment_identity import aircraft_data_identity
+
+
+def write_validation_record(folder, annotation_file, detector, config):
+    folder = Path(folder)
+    record = {
+        "split": "validation",
+        "dataset_identity": aircraft_data_identity([annotation_file]),
+        "model_version": detector.version,
+        "tiling": config["aircraft"].get("tiled_inference", {}),
+        "metrics": json.loads((folder / "aircraft_metrics.json").read_text()),
+    }
+    (folder / "validation_record.json").write_text(json.dumps(record, indent=2))
 
 
 def metric_rank_value(metrics: dict, key: str) -> float:
@@ -43,16 +56,25 @@ def main() -> int:
             "external-aircraft",
             "all",
         ),
-        default="all",
+        default="aircraft-transformers",
     )
     parser.add_argument("--config", default="config.yaml")
+    parser.add_argument("--split", choices=("validation", "test"), default="validation")
+    parser.add_argument("--final-test", action="store_true",
+                        help="Explicitly unlock final/external testing after model selection is frozen.")
     args = parser.parse_args()
     config = load_config(args.config)
+    if (args.split == "test" or args.target == "external-aircraft") and not args.final_test:
+        parser.error("Final test is locked. Freeze validation model selection, then pass --final-test --split test.")
+    if args.split == "validation" and args.target in {"engine", "engine-bladesynth", "patchcore", "all"}:
+        parser.error("Engine validation contains normals only: calibrate during training; AP/AUROC model selection needs a separate labeled development set.")
     reports = Path(config["paths"]["reports"])
+    if args.split == "validation":
+        reports = reports / "validation"
     if args.target == "aircraft":
-        test_json = Path(config["paths"]["processed"]) / "aircraft" / "test.json"
+        test_json = Path(config["paths"]["processed"]) / "aircraft" / f"{args.split}.json"
         detector = AircraftDetector.load(config["aircraft"]["checkpoint"])
-        predictions, latencies = collect_predictions(detector, test_json)
+        predictions, latencies = collect_predictions(detector, test_json, config=config)
         evaluate_aircraft_predictions(
             test_json,
             predictions,
@@ -61,12 +83,12 @@ def main() -> int:
             confidence_threshold=detector.confidence_threshold,
         )
     if args.target in {"aircraft-transformers", "all"}:
-        test_json = Path(config["paths"]["processed"]) / "aircraft" / "test.json"
+        test_json = Path(config["paths"]["processed"]) / "aircraft" / f"{args.split}.json"
         for candidate_name, candidate in config["aircraft"].get(
             "transformer_candidates", {}
         ).items():
             detector = AircraftDetector.load(candidate["checkpoint"])
-            predictions, latencies = collect_predictions(detector, test_json)
+            predictions, latencies = collect_predictions(detector, test_json, config=config)
             evaluate_aircraft_predictions(
                 test_json,
                 predictions,
@@ -74,10 +96,13 @@ def main() -> int:
                 latencies_ms=latencies,
                 confidence_threshold=detector.confidence_threshold,
             )
+            if args.split == "validation":
+                write_validation_record(reports / "aircraft_transformers" / candidate_name,
+                                        test_json, detector, config)
     if args.target in {"faster-rcnn", "all"}:
-        test_json = Path(config["paths"]["processed"]) / "aircraft" / "test.json"
+        test_json = Path(config["paths"]["processed"]) / "aircraft" / f"{args.split}.json"
         detector = FasterRCNNBaseline.load(config["baselines"]["faster_rcnn"]["checkpoint"])
-        predictions, latencies = collect_predictions(detector, test_json)
+        predictions, latencies = collect_predictions(detector, test_json, config=config)
         evaluate_aircraft_predictions(
             test_json,
             predictions,
@@ -85,6 +110,8 @@ def main() -> int:
             latencies_ms=latencies,
             confidence_threshold=detector.confidence_threshold,
         )
+        if args.split == "validation":
+            write_validation_record(reports / "baselines/faster_rcnn", test_json, detector, config)
     if args.target in {"engine", "engine-bladesynth", "all"}:
         variants = []
         if args.target in {"engine", "all"}:
@@ -167,8 +194,11 @@ def main() -> int:
         )
         external_root = reports / "external_generalization"
         external_json = external_root / "iisc_external_test.json"
+        if detector.labels == ["defect"]:
+            from src.data import collapse_aircraft_annotations
+            collapse_aircraft_annotations(records)
         records_to_coco(records, detector.labels, external_json)
-        predictions, latencies = collect_predictions(detector, external_json)
+        predictions, latencies = collect_predictions(detector, external_json, config=config)
         evaluate_aircraft_predictions(
             external_json,
             predictions,
@@ -226,17 +256,18 @@ def main() -> int:
         selection = {
             "aircraft": {
                 "ranking": aircraft_ranking,
-                "recommended": aircraft_ranking[0],
+                "recommended": None,
                 "selection_rule": "highest mAP@50:95, then recall",
             },
             "engine": {
                 "ranking": engine_ranking,
-                "recommended": engine_ranking[0],
+                "recommended": None,
                 "selection_rule": "highest image average precision, then image AUROC, then AUPRO",
             },
-            "warning": "Recommendations are portfolio experiment winners, not aviation certification.",
+            "split": "test",
+            "warning": "Descriptive test rankings only. Never use these to select or tune models.",
         }
-        (reports / "model_selection.json").write_text(
+        (reports / "test_comparison.json").write_text(
             json.dumps(selection, indent=2), encoding="utf-8"
         )
     return 0

@@ -1,5 +1,9 @@
 # Kaggle training runbook
 
+The validation-first protocol in [ACCURACY_PLAN.md](ACCURACY_PLAN.md) supersedes the older
+test-based model-ranking instructions below. Training does not automatically evaluate engine
+test data. Use a fresh experiment and the new grouping manifest.
+
 For the beginner-friendly per-friend cells, download links, and notebook-wide deadline,
 use [KAGGLE_FRIENDS.md](KAGGLE_FRIENDS.md). Its session wrapper supersedes the direct
 training commands below for notebook use.
@@ -166,8 +170,9 @@ Compare aircraft models using frozen-test mAP@50:95, mAP@50, recall, and missed-
 models using image AUROC, image average precision, pixel AUROC, AUPRO, false-alarm rate, and missed-anomaly
 rate. Training loss alone does not select the winner.
 
-`reports/model_selection.json` ranks aircraft and engine models separately and records the recommended
-winner and selection rule. It never compares aircraft mAP directly with engine AUROC.
+`scripts/select_aircraft_model.py` writes `reports/model_selection.json` from matching validation
+records only. Engine model selection needs a separate labeled development set; held-out normals
+alone cannot rank anomaly AUROC. Final-test comparisons are descriptive, not selection inputs.
 
 Only after this comparison should `aircraft.checkpoint` point to the winning candidate. Keep the baseline
 results in the project because they demonstrate that the transformer choice was measured rather than

@@ -26,6 +26,8 @@ from src.data import (
 )
 from src.engine_model import MaskedMultiScaleReconstruction
 from src.evaluation import evaluate_engine_predictions
+from src.experiment_identity import validate_resume_identity
+from src.preprocessing import sha256_file
 from src.training_artifacts import artifact_output_path, atomic_torch_save, create_training_archive
 from src.training_chunks import SessionTimeGuard, boundary_for_part, training_boundaries
 from src.training_monitor import (
@@ -77,7 +79,8 @@ def main() -> int:
     seed = int(config["training"]["seed"])
     seed_everything(seed)
     train_paths, validation_paths = split_aebad_training_paths(
-        config["paths"]["aebad"], float(engine["validation_fraction"]), seed
+        config["paths"]["aebad"], float(engine["validation_fraction"]),
+        int(config["dataset"].get("split_seed", seed))
     )
     video_paths: list[str] = []
     synthetic_normal_paths: list[str] = []
@@ -213,12 +216,21 @@ def main() -> int:
     start_epoch = 0
     global_step = 0
     resume_path = Path(args.resume) if args.resume else None
+    experiment_identity = {
+        "revision": 2, "variant": args.variant, "seed": seed,
+        "recipe": {key: value for key, value in engine.items()
+                   if key not in {"checkpoint", "bladesynth_checkpoint"}},
+        "train_hashes": sorted(sha256_file(Path(p)) for p in train_paths),
+        "validation_hashes": sorted(sha256_file(Path(p)) for p in validation_paths),
+        "auxiliary_hashes": sorted(sha256_file(Path(p)) for p in auxiliary_paths),
+    }
     if resume_path is None and args.quarter is not None and training_state.is_file():
         resume_path = training_state
     if args.quarter is not None and args.quarter > 1 and resume_path is None:
         parser.error(f"Part {args.quarter} requires the previous state at {training_state}.")
     if resume_path is not None:
         checkpoint = torch.load(resume_path, map_location=model.device, weights_only=False)
+        validate_resume_identity(checkpoint, experiment_identity)
         model.load_state_dict(checkpoint["state_dict"])
         optimizer.load_state_dict(checkpoint["optimizer"])
         scheduler.load_state_dict(checkpoint["scheduler"])
@@ -312,6 +324,7 @@ def main() -> int:
                     "epoch": epoch,
                     "global_step": global_step,
                     "metadata": {
+                        "experiment_identity": experiment_identity,
                         "config": config,
                         "thresholds_calibrated": False,
                         "epoch_seconds": time_guard.epoch_seconds,
@@ -382,13 +395,15 @@ def main() -> int:
     }
     log_numeric_metrics(writer, "validation_calibration", calibration_metrics, total_epochs)
     metadata = {
+        "experiment_identity": experiment_identity,
         "version": f"epoch-{total_epochs}",
         "epoch": total_epochs,
         "anomaly_threshold": anomaly_threshold,
         "pixel_threshold": pixel_threshold,
         "threshold_source": "held-out AeBAD-S training normals",
         "threshold_quantile": quantile,
-        "inference_masks": int(engine["inference_masks"]),
+        "inference_mask_ratio": 0.0,
+        "inference_passes": 1,
         "validation_calibration": {
             "normal_samples": len(validation_scores),
             "score_mean": float(np.mean(validation_scores)),
@@ -423,7 +438,7 @@ def main() -> int:
         },
         training_state,
     )
-    if args.mode == "full":
+    if args.mode == "full" and config["training"].get("evaluate_test_after_training", False):
         test_dataset = AeBADDataset(
             config["paths"]["aebad"], "test", image_size=int(engine["image_size"])
         )

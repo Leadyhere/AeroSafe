@@ -21,7 +21,7 @@ from src.preprocessing import SUPPORTED_IMAGE_EXTENSIONS, load_image, sha256_fil
 
 def load_mining_model(model_name: str, checkpoint: str | Path):
     """Load one of the two aircraft detectors behind their shared prediction API."""
-    if model_name == "deformable_detr":
+    if model_name in {"deformable_detr", "rt_detr", "rt_detr_v2"}:
         return AircraftDetector.load(checkpoint)
     if model_name == "faster_rcnn":
         return FasterRCNNBaseline.load(checkpoint)
@@ -36,8 +36,8 @@ def main() -> int:
     parser.add_argument("--checkpoint", default=None)
     parser.add_argument(
         "--model",
-        choices=("deformable_detr", "faster_rcnn"),
-        default="deformable_detr",
+        choices=("rt_detr_v2", "rt_detr", "deformable_detr", "faster_rcnn"),
+        default="rt_detr_v2",
         help="Detector whose false positives should be mined.",
     )
     parser.add_argument("--threshold", type=float, default=0.20)
@@ -64,8 +64,8 @@ def main() -> int:
     if not candidates:
         parser.error(f"No supported images found under {source}")
     default_checkpoint = (
-        config["aircraft"]["checkpoint"]
-        if args.model == "deformable_detr"
+        config["aircraft"]["transformer_candidates"][args.model]["checkpoint"]
+        if args.model != "faster_rcnn"
         else config["baselines"]["faster_rcnn"]["checkpoint"]
     )
     checkpoint = args.checkpoint or default_checkpoint
@@ -98,7 +98,9 @@ def main() -> int:
                     "detections": detections,
                 }
             )
-    output_root = Path(config["paths"]["hard_negatives"]) / f"round_{args.round}"
+    output_root = Path(config["paths"]["hard_negatives"]).parent / "pending" / f"round_{args.round}"
+    if output_root.exists():
+        parser.error("This mining round already exists. Use a new round number.")
     output_root.mkdir(parents=True, exist_ok=True)
     image_root = output_root / "images"
     image_root.mkdir(exist_ok=True)
@@ -114,8 +116,8 @@ def main() -> int:
     ]
     payload = {
         "info": {
-            "description": f"Verified normal hard negatives, mining round {args.round}",
-            "aeroinspect_reviewed": True,
+            "description": f"Pending human approval: normal hard negatives, mining round {args.round}",
+            "aeroinspect_reviewed": False,
         },
         "licenses": [],
         "categories": categories,
@@ -153,13 +155,8 @@ def main() -> int:
         ),
         encoding="utf-8",
     )
-    # The parent marker enables all accumulated reviewed rounds.
-    Path(config["paths"]["hard_negatives"]).mkdir(parents=True, exist_ok=True)
-    (Path(config["paths"]["hard_negatives"]) / "REVIEWED").write_text(
-        "Every listed source image was explicitly confirmed defect-free.\n", encoding="utf-8"
-    )
     print(f"Selected {len(selected)} hard-negative images in round {args.round}: {output_root}")
-    print("Run prepare_data.py, then retrain both aircraft detectors before the next mining round.")
+    print("Human review required: pending images are NOT training data. Approve only confirmed defect-free images before importing into the reviewed folder.")
     return 0
 
 

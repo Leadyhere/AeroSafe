@@ -33,7 +33,8 @@ def test_warmup_cosine_schedule_warms_then_decays():
     ]
     assert values[:2] == [0.5, 1.0]
     assert values[2] == pytest.approx(1.0)
-    assert values[-1] == pytest.approx(0.0)
+    assert values[-1] > 0.0
+    assert warmup_cosine_multiplier(6, warmup_epochs=2, total_epochs=6) == pytest.approx(0.0)
 
 
 def test_long_training_is_split_into_main_epoch_quarters():

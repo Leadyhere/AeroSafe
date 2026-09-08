@@ -21,6 +21,7 @@ from src import load_config
 from src.aircraft_model import AircraftDetector, collate_detection_batch
 from src.data import AircraftDetectionDataset, detection_sampling_weights
 from src.evaluation import evaluate_aircraft_predictions
+from src.experiment_identity import aircraft_data_identity, validate_resume_identity
 from src.preprocessing import build_aircraft_augmentation, load_image
 from src.training_artifacts import artifact_output_path, atomic_torch_save, create_training_archive
 from src.training_chunks import SessionTimeGuard, boundary_for_part, training_boundaries
@@ -44,14 +45,27 @@ def seed_everything(seed: int) -> None:
         torch.cuda.manual_seed_all(seed)
 
 
-def collect_predictions(detector, annotation_file: Path, limit: int | None = None):
+def collect_predictions(detector, annotation_file: Path, limit: int | None = None, *, config=None):
     payload = json.loads(annotation_file.read_text(encoding="utf-8"))
+    expected_labels = [c["name"] for c in sorted(payload["categories"], key=lambda c: c["id"])]
+    if list(detector.labels) != expected_labels:
+        raise ValueError("Checkpoint label taxonomy differs from this dataset. Do not use old 7-class weights for binary evaluation.")
     category_ids = [item["id"] for item in sorted(payload["categories"], key=lambda item: item["id"])]
     predictions, latencies = [], []
     for item in payload["images"][:limit]:
         # COCO AP needs the ranked prediction set; the deployment threshold is applied only in the app.
-        detections = detector.predict(load_image(item["file_name"]), threshold=0.001)
-        latencies.append(detector.last_inference_time_ms)
+        image = load_image(item["file_name"])
+        tiling = (config or {}).get("aircraft", {}).get("tiled_inference", {})
+        if tiling.get("enabled", False) and max(image.size) >= tiling.get("min_image_size", 768):
+            from src.inference import predict_aircraft_tiled
+            detections, elapsed = predict_aircraft_tiled(
+                detector, image, threshold=0.001, tile_size=tiling.get("tile_size", 512),
+                overlap=tiling.get("overlap", 128), nms_iou=tiling.get("nms_iou", 0.45)
+            )
+        else:
+            detections = detector.predict(image, threshold=0.001)
+            elapsed = detector.last_inference_time_ms
+        latencies.append(elapsed)
         for detection in detections:
             x1, y1, x2, y2 = detection["bbox"]
             predictions.append(
@@ -98,7 +112,8 @@ def warmup_cosine_multiplier(epoch: int, *, warmup_epochs: int, total_epochs: in
         raise ValueError("Warm-up must be non-negative and smaller than total epochs.")
     if epoch < warmup_epochs:
         return float(epoch + 1) / max(1, warmup_epochs)
-    progress = (epoch - warmup_epochs) / max(1, total_epochs - warmup_epochs - 1)
+    # Epoch indices are zero-based: reach zero only AFTER the final update.
+    progress = (epoch - warmup_epochs) / max(1, total_epochs - warmup_epochs)
     return 0.5 * (1.0 + math.cos(math.pi * min(1.0, progress)))
 
 
@@ -143,6 +158,8 @@ def main() -> int:
     seed_everything(seed)
     processed = Path(config["paths"]["processed"]) / "aircraft"
     train_file, validation_file = processed / "train.json", processed / "validation.json"
+    if aircraft_config.get("training_annotations_override"):
+        train_file = Path(aircraft_config["training_annotations_override"])
     auxiliary_file = Path(config["paths"]["processed"]) / "aircraft_auxiliary/agdd_train.json"
     if not train_file.is_file() or not validation_file.is_file():
         parser.error("Prepared COCO files are missing. Run scripts/prepare_data.py first.")
@@ -268,12 +285,20 @@ def main() -> int:
     best_map = -1.0
     global_step = 0
     resume_path = Path(args.resume) if args.resume else None
+    experiment_identity = {
+        "revision": 2, "architecture": candidate_name, "seed": seed,
+        "data": aircraft_data_identity([train_file, validation_file, auxiliary_file]),
+        "recipe": {key: value for key, value in aircraft_config.items()
+                   if key not in {"checkpoint", "transformer_candidates", "training_annotations_override"}},
+        "candidate": {key: value for key, value in candidate_config.items() if key != "checkpoint"},
+    }
     if resume_path is None and args.quarter is not None and training_state.is_file():
         resume_path = training_state
     if args.quarter is not None and args.quarter > 1 and resume_path is None:
         parser.error(f"Part {args.quarter} requires the previous state at {training_state}.")
     if resume_path is not None:
         state = torch.load(resume_path, map_location=detector.device, weights_only=False)
+        validate_resume_identity(state, experiment_identity)
         resumed_architecture = state.get("architecture")
         if resumed_architecture is not None and resumed_architecture != candidate_name:
             parser.error(
@@ -390,7 +415,7 @@ def main() -> int:
             or stopped_for_time
         ):
             predictions, latencies = collect_predictions(
-                detector, validation_file, 2 if args.mode == "smoke" else None
+                detector, validation_file, 2 if args.mode == "smoke" else None, config=config
             )
             metrics = evaluate_aircraft_predictions(
                 validation_file,
@@ -401,6 +426,7 @@ def main() -> int:
             )
             log_numeric_metrics(writer, "validation", metrics, epoch + 1)
         metadata = {
+            "experiment_identity": experiment_identity,
             "architecture": candidate_name,
             "version": f"epoch-{epoch + 1}",
             "epoch": epoch + 1,

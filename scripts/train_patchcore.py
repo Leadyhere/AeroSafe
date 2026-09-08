@@ -51,7 +51,7 @@ def main() -> int:
     train_paths, validation_paths = split_aebad_training_paths(
         config["paths"]["aebad"],
         float(engine["validation_fraction"]),
-        int(config["training"]["seed"]),
+        int(config["dataset"].get("split_seed", config["training"]["seed"])),
     )
     if args.mode == "smoke":
         train_paths, validation_paths = train_paths[:2], validation_paths[:2]
@@ -122,6 +122,7 @@ def main() -> int:
         else Path(baseline["checkpoint"])
     )
     metadata = {
+        "patch_sampling": model.metadata["patch_sampling"],
         "version": "fitted",
         "anomaly_threshold": anomaly_threshold,
         "pixel_threshold": pixel_threshold,
@@ -134,8 +135,8 @@ def main() -> int:
     }
     model.save(checkpoint_path, metadata)
 
-    if args.mode == "full":
-        evaluation_root = Path(config["paths"]["reports"]) / "baselines/patchcore"
+    evaluation_root = Path(config["paths"]["reports"]) / "baselines/patchcore"
+    if args.mode == "full" and config["training"].get("evaluate_test_after_training", False):
         test_dataset = AeBADDataset(
             config["paths"]["aebad"], "test", image_size=int(engine["image_size"])
         )

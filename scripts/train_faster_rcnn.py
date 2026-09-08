@@ -20,6 +20,7 @@ from src import load_config
 from src.baselines import FasterRCNNBaseline, FasterRCNNDataset, collate_faster_rcnn
 from src.data import detection_sampling_weights
 from src.evaluation import evaluate_aircraft_predictions
+from src.experiment_identity import aircraft_data_identity, validate_resume_identity
 from src.preprocessing import build_aircraft_augmentation
 from src.training_artifacts import artifact_output_path, atomic_torch_save, create_training_archive
 from src.training_chunks import SessionTimeGuard, boundary_for_part, training_boundaries
@@ -61,6 +62,8 @@ def main() -> int:
 
     processed = Path(config["paths"]["processed"]) / "aircraft"
     train_file = processed / "train.json"
+    if config["aircraft"].get("training_annotations_override"):
+        train_file = Path(config["aircraft"]["training_annotations_override"])
     validation_file = processed / "validation.json"
     auxiliary_file = Path(config["paths"]["processed"]) / "aircraft_auxiliary/agdd_train.json"
     if not train_file.is_file() or not validation_file.is_file():
@@ -154,12 +157,20 @@ def main() -> int:
     )
     start_epoch, best_map, global_step = 0, -1.0, 0
     resume_path = Path(args.resume) if args.resume else None
+    experiment_identity = {
+        "revision": 2, "architecture": "faster_rcnn", "seed": seed,
+        "data": aircraft_data_identity([train_file, validation_file, auxiliary_file]),
+        "recipe": {key: value for key, value in baseline.items() if key != "checkpoint"},
+        "augmentation": config["aircraft"]["small_defect_crop_probability"],
+        "tiling": config["aircraft"]["tiled_inference"],
+    }
     if resume_path is None and args.quarter is not None and state_path.is_file():
         resume_path = state_path
     if args.quarter is not None and args.quarter > 1 and resume_path is None:
         parser.error(f"Part {args.quarter} requires the previous state at {state_path}.")
     if resume_path is not None:
         state = torch.load(resume_path, map_location=model.device, weights_only=False)
+        validate_resume_identity(state, experiment_identity)
         model.model.load_state_dict(state["state_dict"])
         optimizer.load_state_dict(state["optimizer"])
         scheduler.load_state_dict(state["scheduler"])
@@ -256,7 +267,7 @@ def main() -> int:
             or stopped_for_time
         ):
             predictions, latencies = collect_predictions(
-                model, validation_file, limit=2 if args.mode == "smoke" else None
+                model, validation_file, limit=2 if args.mode == "smoke" else None, config=config
             )
             metrics = evaluate_aircraft_predictions(
                 validation_file,
@@ -267,6 +278,7 @@ def main() -> int:
             )
             log_numeric_metrics(writer, "validation", metrics, epoch + 1)
         metadata = {
+            "experiment_identity": experiment_identity,
             "version": f"epoch-{epoch + 1}",
             "epoch": epoch + 1,
             "validation_metrics": metrics,

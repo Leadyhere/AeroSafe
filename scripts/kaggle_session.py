@@ -77,6 +77,14 @@ def configure_data(model: str, input_root: str = "/kaggle/input") -> None:
                        "checkpoints": "checkpoints", "artifacts": "artifacts"}.items():
         config["paths"][key] = value
     Path("config.yaml").write_text(yaml.safe_dump(config, sort_keys=False), encoding="utf-8")
+    if model in AIRCRAFT:
+        manifests = list(root.rglob("aerosafe_group_manifest.csv"))
+        if len(manifests) > 1:
+            raise ValueError("Attach exactly one reviewed grouping-manifest dataset version.")
+        if manifests:
+            config["paths"]["group_manifest"] = manifests[0].as_posix()
+            Path("config.yaml").write_text(yaml.safe_dump(config, sort_keys=False), encoding="utf-8")
+            print(f"FOUND grouping manifest: {manifests[0]}")
     print("Dataset paths configured. Run prepare() to validate their contents.")
 
 
@@ -132,7 +140,7 @@ def validate(model: str) -> None:
     else:
         train, val = split_aebad_training_paths(
             config["paths"]["aebad"], config["engine"]["validation_fraction"],
-            config["training"]["seed"],
+            config["dataset"].get("split_seed", config["training"]["seed"]),
         )
         test = AeBADDataset(config["paths"]["aebad"], "test")
         missing = [p for p in test.paths if not ({"normal", "good"} & set(p.parts))

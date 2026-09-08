@@ -227,7 +227,7 @@ def main() -> int:
             )
         )
         return 0
-    run([sys.executable, "scripts/evaluate.py", "--target", "all", "--config", args.config])
+    run([sys.executable, "scripts/evaluate.py", "--target", "aircraft-transformers", "--config", args.config])
     return 0
 
 

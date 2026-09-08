@@ -265,15 +265,19 @@ class PatchCoreBaseline:
         import torch
 
         collected = []
+        image_count = len(loader.dataset)
+        if image_count > self.max_patches:
+            raise ValueError("max_patches must cover at least one patch from every training image.")
+        generator = torch.Generator(device="cpu").manual_seed(42)
+        image_index = 0
         for batch_index, batch in enumerate(loader):
             features = self._embeddings(batch["image"])
-            patches = features.permute(0, 2, 3, 1).reshape(-1, features.shape[1]).cpu()
-            collected.append(patches)
-            # Bound host RAM before the final concatenation on large AeBAD-S inputs.
-            if sum(len(item) for item in collected) > self.max_patches:
-                bounded = torch.cat(collected)
-                indices = torch.linspace(0, len(bounded) - 1, self.max_patches).long()
-                collected = [bounded[indices]]
+            for feature in features:
+                patches = feature.permute(1, 2, 0).reshape(-1, feature.shape[0]).cpu()
+                quota = self.max_patches // image_count + int(image_index < self.max_patches % image_count)
+                indices = torch.randperm(len(patches), generator=generator)[:quota]
+                collected.append(patches[indices])
+                image_index += 1
             if progress_callback is not None:
                 progress_callback(
                     batch_index + 1,
@@ -290,6 +294,12 @@ class PatchCoreBaseline:
             embeddings = embeddings[indices]
         target = max(1, round(len(embeddings) * self.coreset_fraction))
         self.memory_bank = self._greedy_coreset(embeddings, target, self.projection_dim).contiguous()
+        self.metadata["patch_sampling"] = {
+            "strategy": "equal per-image random quotas before greedy coreset",
+            "images_seen": image_index,
+            "candidate_patches": len(embeddings),
+            "all_training_images_visited": image_index == image_count,
+        }
 
     def _nearest_distances(self, queries, *, chunk_size: int = 2048):
         import torch

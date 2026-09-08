@@ -32,6 +32,7 @@ aircraft_labels:
   surface_damage: [dent scratch or paint falling, defect]
 
 dataset:
+  split_seed: 42
   split: {train: 0.70, validation: 0.15, test: 0.15}
   # The public sources use overlapping class definitions (for example the
   # broad ASDD surface-damage label overlaps dent, scratch, and paint damage).
@@ -45,6 +46,7 @@ dataset:
   require_review_marker: true
 
 aircraft:
+  training_annotations_override: null  # Winner-only sliced-training ablation; validation/test stay fixed.
   # The deployed checkpoint remains unchanged until a candidate wins on the
   # frozen test set. Candidate runs never overwrite it.
   pretrained_model: SenseTime/deformable-detr
@@ -93,7 +95,7 @@ engine:
   mae_backbone: vit_base_patch16_224.mae
   image_size: 224
   mask_ratio: 0.40
-  inference_masks: 1
+  # Deterministic unmasked evaluation; no ignored mask-count setting.
   # Match the published AeBAD-S MMR optimization recipe before comparing
   # alternative anomaly transformers.
   epochs: 200
@@ -128,6 +130,7 @@ baselines:
     projection_dim: 128
 
 training:
+  evaluate_test_after_training: false
   seed: 42
   num_workers: 4
   mixed_precision: true

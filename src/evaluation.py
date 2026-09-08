@@ -283,6 +283,7 @@ def evaluate_aircraft_predictions(
             ground_truth, thresholded_predictions
         ),
         "counts": {key: prf[key] for key in ("tp", "fp", "fn")},
+        "false_positives_per_image": prf["fp"] / max(1, len(payload["images"])),
         "ap_per_class": per_class,
         "threshold_metrics_per_class": per_class_prf,
         "inference_latency_ms": {

@@ -758,10 +758,31 @@ def load_group_manifest(
     for record_path in records_by_path:
         by_name[Path(record_path).name.lower()].append(record_path)
     matched = 0
+    by_hash: dict[str, list[str]] = defaultdict(list)
+    if any(row.get("sha256", "").strip() for row in rows):
+        for record_path in records_by_path:
+            by_hash[sha256_file(Path(record_path))].append(record_path)
     for row_number, row in enumerate(rows, start=2):
         image_value = str(row.get("image", "")).strip()
         if not image_value:
             raise DatasetConfigurationError(f"Empty image at {path}:{row_number}")
+        fingerprint = row.get("sha256", "").strip()
+        if fingerprint:
+            targets = by_hash.get(fingerprint, [])
+            if not targets:
+                raise DatasetConfigurationError(f"Manifest SHA-256 not found at {path}:{row_number}")
+            split = row.get("split", "").strip().lower()
+            if split and split not in {"train", "validation", "test"}:
+                raise DatasetConfigurationError(f"Invalid manifest split {split!r}")
+            for target in targets:
+                record = records_by_path[target]
+                if split and record.fixed_split and record.fixed_split != split:
+                    raise DatasetConfigurationError(f"Conflicting fixed split for SHA-256 {fingerprint}")
+                record.leakage_keys = tuple(sorted(set(record.leakage_keys) | set(_leakage_keys(row))))
+                if split:
+                    record.fixed_split = split
+            matched += len(targets)
+            continue
         candidate = str(Path(image_value).resolve())
         if candidate in records_by_path:
             resolved = candidate
@@ -831,6 +852,7 @@ def records_to_coco(
             {
                 "id": image_id,
                 "file_name": record.path,
+                "sha256": sha256_file(Path(record.path)),
                 "width": record.width,
                 "height": record.height,
                 "source": record.source,
@@ -1034,7 +1056,7 @@ def prepare_aircraft_data(config: Mapping[str, Any]) -> dict[str, Any]:
         record_paths,
         leakage_groups,
         dataset_config["split"],
-        int(config["training"]["seed"]),
+        int(dataset_config.get("split_seed", config["training"]["seed"])),
         fixed_splits=fixed_splits,
     )
     split_lookup = {path: split for split, split_paths in splits.items() for path in split_paths}
@@ -1517,7 +1539,7 @@ def prepare_datasets(
         train_paths, validation_paths = split_aebad_training_paths(
             config["paths"]["aebad"],
             float(config["engine"]["validation_fraction"]),
-            int(config["training"]["seed"]),
+            int(config["dataset"].get("split_seed", config["training"]["seed"])),
         )
         aebad_test = AeBADDataset(
             config["paths"]["aebad"], "test", image_size=int(config["engine"]["image_size"])
