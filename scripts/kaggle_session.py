@@ -17,7 +17,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from scripts.kaggle_train_all import MODEL_ORDER, training_command
+from scripts.kaggle_train_all import MODEL_ORDER, model_boundaries, training_command
 from src.training_artifacts import sha256_file
 
 FRIENDS = {
@@ -199,6 +199,42 @@ def run_part(model: str, part: int, started_at: float) -> None:
         raise RuntimeError("Less than 1.5 hours left in the training budget. Start a fresh session.")
     command = training_command(model, "config.yaml", mode="full", part=part,
                                max_session_hours=budget)
+    try:
+        bounded_command(command, started_at, 10.5)
+    finally:
+        download_links(model)
+
+
+def run_until(model: str, target_epoch: int, started_at: float, *, resume_required: bool = False) -> None:
+    """Train to an absolute epoch target, with the existing session deadline.
+
+    Checkpoints must be from the user's own trusted run. Changing a stop target
+    does not change the total-epoch recipe or restart its learning-rate schedule.
+    """
+    import torch
+
+    if model == "patchcore":
+        raise ValueError("PatchCore has no epoch cycles; use run_part for its single fit.")
+    config = yaml.safe_load(Path("config.yaml").read_text(encoding="utf-8"))
+    total = model_boundaries(config, model)[-1]
+    if not 1 <= target_epoch <= total:
+        raise ValueError(f"Target must be between 1 and {total} completed epochs.")
+    state = state_path(model)
+    if resume_required and not state.is_file():
+        raise FileNotFoundError("Restore the previous cycle's training archive first.")
+    if not torch.cuda.is_available():
+        raise RuntimeError("Enable a Kaggle GPU before training.")
+    budget = min(9.0, remaining_seconds(started_at, 9.5) / 3600)
+    if budget < 1.5:
+        raise RuntimeError("Save your outputs and start a fresh session; training budget is low.")
+    command = training_command(model, "config.yaml", mode="full", max_session_hours=budget)
+    # Explicit epoch targets replace the old quarter-based stopping rule.
+    quarter_index = command.index("--quarter")
+    del command[quarter_index:quarter_index + 2]
+    command += ["--stop-after-epoch", str(target_epoch)]
+    if state.is_file():
+        command += ["--resume", str(state)]
+    print(f"Target: {target_epoch}/{total} completed epochs. Time cutoff may stop earlier.")
     try:
         bounded_command(command, started_at, 10.5)
     finally:

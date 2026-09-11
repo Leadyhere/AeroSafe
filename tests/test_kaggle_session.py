@@ -29,6 +29,55 @@ def test_clock_accounts_for_setup_time(monkeypatch):
     assert remaining_seconds(0, 1) == 0
 
 
+@pytest.mark.parametrize("model", ["rt_detr_v2", "rt_detr", "deformable_detr", "faster_rcnn", "mmr_real", "mmr_bladesynth"])
+def test_explicit_cycle_target_and_resume(tmp_path, monkeypatch, model):
+    import scripts.kaggle_session as session
+
+    monkeypatch.chdir(tmp_path)
+    Path("config.yaml").write_text("{}")
+    monkeypatch.setattr(session, "model_boundaries", lambda config, model: [23])
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(session, "remaining_seconds", lambda start, limit: 8 * 3600)
+    calls = []
+    downloads = []
+    monkeypatch.setattr(session, "bounded_command", lambda *args: calls.append(args))
+    monkeypatch.setattr(session, "download_links", downloads.append)
+    session.run_until(model, 12, 123)
+    command, start, deadline = calls[-1]
+    assert "--quarter" not in command
+    assert command[command.index("--stop-after-epoch") + 1] == "12"
+    assert "--resume" not in command
+    assert (start, deadline) == (123, 10.5)
+    assert downloads == [model]
+    with pytest.raises(FileNotFoundError, match="Restore"):
+        session.run_until(model, 23, 123, resume_required=True)
+    state = session.state_path(model)
+    state.parent.mkdir(parents=True, exist_ok=True)
+    state.touch()
+    session.run_until(model, 23, 123, resume_required=True)
+    command = calls[-1][0]
+    assert command[command.index("--resume") + 1] == str(state)
+    assert command[command.index("--stop-after-epoch") + 1] == "23"
+
+
+def test_explicit_cycle_shows_downloads_on_failure(tmp_path, monkeypatch):
+    import scripts.kaggle_session as session
+
+    monkeypatch.chdir(tmp_path)
+    Path("config.yaml").write_text("{}")
+    monkeypatch.setattr(session, "model_boundaries", lambda config, model: [23])
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(session, "remaining_seconds", lambda start, limit: 8 * 3600)
+    downloads = []
+    monkeypatch.setattr(session, "download_links", downloads.append)
+    def fail(*args):
+        raise RuntimeError("deadline")
+    monkeypatch.setattr(session, "bounded_command", fail)
+    with pytest.raises(RuntimeError, match="deadline"):
+        session.run_until("rt_detr_v2", 12, 0)
+    assert downloads == ["rt_detr_v2"]
+
+
 def test_ambiguous_dataset_is_rejected(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     Path("config.yaml").write_text("paths: {}")
