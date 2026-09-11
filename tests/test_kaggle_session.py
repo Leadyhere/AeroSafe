@@ -38,6 +38,24 @@ def test_ambiguous_dataset_is_rejected(tmp_path, monkeypatch):
         configure_data("mmr_real", str(tmp_path))
 
 
+def test_agdd_nested_inside_imdd_is_discovered(tmp_path, monkeypatch):
+    import yaml
+
+    monkeypatch.chdir(tmp_path)
+    Path("config.yaml").write_text("paths: {}")
+    inputs = tmp_path / "input"
+    imdd = inputs / "0to4_aircraft_skin4000pics"
+    nested = imdd / "AGDD-main" / "AGDD-main"
+    nested.mkdir(parents=True)
+    (inputs / "Dataset2.v2-defect-classification.coco").mkdir()
+    (inputs / "aircraftsurface1.v1i.coco").mkdir()
+    (inputs / "0-4aircraft4000.csv").write_text("fixture")
+    configure_data("deformable_detr", str(inputs))
+    config = yaml.safe_load(Path("config.yaml").read_text())
+    assert Path(config["paths"]["agdd"]) == nested.parent
+    assert Path(config["paths"]["imdd_aircraft_images"]) == imdd
+
+
 def test_deadline_terminates_worker_group(monkeypatch):
     import scripts.kaggle_session as session
 

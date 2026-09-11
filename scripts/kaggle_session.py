@@ -46,7 +46,7 @@ def configure_data(model: str, input_root: str = "/kaggle/input") -> None:
     )
     if model == "mmr_bladesynth":
         required.append("bladesynth")
-    # Walk directory names only; avoid entering known large image datasets.
+    # Uploads may nest one dataset inside another, so don't prune named roots.
     candidates: dict[str, list[Path]] = {key: [] for key in required}
     names = {DATA[key][0].lower(): key for key in required}
     root = Path(input_root)
@@ -57,11 +57,12 @@ def configure_data(model: str, input_root: str = "/kaggle/input") -> None:
         for name in [*dirs, *files]:
             if name.lower() in names:
                 candidates[names[name.lower()]].append(Path(current) / name)
-                if name in dirs:
-                    dirs.remove(name)
     config = yaml.safe_load(Path("config.yaml").read_text(encoding="utf-8"))
     for key in required:
         matches = candidates[key]
+        # AGDD-main/AGDD-main is a wrapper around the same dataset. Keep its
+        # outer root; the actual loader still rejects multiple label trees.
+        matches = [p for p in matches if not any(q != p and q in p.parents for q in matches)]
         if not matches and DATA[key][1]:
             matches = [p for p in root.rglob(DATA[key][1]) if p.is_dir()]
         if len(matches) != 1:

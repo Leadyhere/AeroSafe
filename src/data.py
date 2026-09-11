@@ -625,6 +625,9 @@ def audit_imdd_aircraft_subset(
         canonical_label(str(row["Categories"]).split(",")[-1]) for row in rows
     )
     rows_by_name = {str(row["Image Name"]).strip().lower(): row for row in rows}
+    # Other datasets can be nested in an upload. Audit only CSV-referenced
+    # IMDD images; report the extra files without relabeling or consuming them.
+    images = [path for path in images if path.name.lower() in rows_by_name]
     folder_label_mismatches = []
     category_to_ids: dict[str, set[str]] = defaultdict(set)
     id_to_categories: dict[str, set[str]] = defaultdict(set)

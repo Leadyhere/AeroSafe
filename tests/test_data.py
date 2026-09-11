@@ -306,6 +306,10 @@ def test_imdd_audit_rejects_missing_images_and_records_no_boxes(tmp_path: Path) 
     assert report["images"] == 1
     assert report["has_localization_boxes"] is False
     assert report["used_for_detector_training"] is False
+    save_image(images / "AGDD-main" / "doc" / "overview.jpg")
+    mixed_report = audit_imdd_aircraft_subset(images, csv_path)
+    assert mixed_report["images"] == 1
+    assert mixed_report["unreferenced_images"] == 1
     csv_path.write_text(
         "Image Name,label,Categories,Description\nmissing.jpg,0,aircraft crack,visible crack\n",
         encoding="utf-8",
