@@ -130,7 +130,7 @@ def main() -> int:
         main_epochs,
         auxiliary_epochs=auxiliary_epochs,
         quarter_count=int(training_config.get("quarter_count", 4)),
-        one_go_max_epochs=int(training_config.get("one_go_max_epochs", 20)),
+        one_go_max_epochs=int(training_config.get("one_go_max_epochs", 1)),
     )
     if args.quarter is not None and args.stop_after_epoch is not None:
         parser.error("Use either --quarter or --stop-after-epoch, not both.")

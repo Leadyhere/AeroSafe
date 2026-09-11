@@ -140,7 +140,8 @@ training:
   max_session_hours: 11.0
   artifact_reserve_minutes: 45
   quarter_count: 4
-  one_go_max_epochs: 20
+  # Four explicit parts for aircraft training as well as MMR.
+  one_go_max_epochs: 1
   tensorboard: true
   # Null stores runs under <reports>/tensorboard/{smoke|full}/<model>.
   tensorboard_log_dir: null

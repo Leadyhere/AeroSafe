@@ -84,7 +84,7 @@ def model_boundaries(config: dict[str, Any], model: str) -> list[int]:
     training = config["training"]
     common = {
         "quarter_count": int(training.get("quarter_count", 4)),
-        "one_go_max_epochs": int(training.get("one_go_max_epochs", 20)),
+        "one_go_max_epochs": int(training.get("one_go_max_epochs", 1)),
     }
     if model in {"rt_detr_v2", "rt_detr", "deformable_detr"}:
         candidate = config["aircraft"]["transformer_candidates"][model]

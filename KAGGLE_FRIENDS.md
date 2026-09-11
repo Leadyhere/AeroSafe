@@ -158,7 +158,9 @@ prefer a complete archive whenever available.
 
 ## Which part next?
 
-- Friends 1–4: PART stays 1 until the archive reaches epoch 23. Partial runs repeat PART=1.
+- Aircraft models (RT-DETRv2, RT-DETR, Deformable DETR, Faster R-CNN): use PART 1–4.
+  Cumulative targets are 8, 13, 18, 23. Part 1 has 3 auxiliary + 5 main epochs;
+  each later part has 5 main epochs. Repeat the current part if it stops early.
 - Friend 5: completed targets are 50, 100, 150, 200 for PART 1, 2, 3, 4 respectively.
 - Friend 6: targets are 55, 105, 155, 205 (five auxiliary epochs are in the first part).
 - Friend 7: one fit, PART=1. PatchCore does not support resuming a half-finished fit.

@@ -20,19 +20,19 @@ session budget, leaving 45 minutes to package the result.
 
 | Run | Type | Purpose | Training data | Epoch plan | Approx. T4 time |
 |---|---|---|---|---:|---:|
-| RT-DETR v2 | Transformer | Primary aircraft localizer | AGDD, then binary ASDD + aircraftsurface1 | 3 + 20, one logical run | 8-16 h |
-| RT-DETR | Transformer | Real-time transformer comparison | Same aircraft split | 3 + 20, one logical run | 8-16 h |
-| Deformable DETR | Transformer | Multi-scale transformer comparison | Same aircraft split | 3 + 20, one logical run | 10-20 h |
+| RT-DETR v2 | Transformer | Primary aircraft localizer | AGDD, then binary ASDD + aircraftsurface1 | 4 parts: 8/5/5/5 epochs | 8-16 h |
+| RT-DETR | Transformer | Real-time transformer comparison | Same aircraft split | 4 parts: 8/5/5/5 epochs | 8-16 h |
+| Deformable DETR | Transformer | Multi-scale transformer comparison | Same aircraft split | 4 parts: 8/5/5/5 epochs | 10-20 h |
 | MMR real | Transformer hybrid | Primary engine anomaly score and heatmap | AeBAD-S normal images | 200; 50/50/50/50 | 6-10 h total |
 | MMR + BladeSynth | Transformer-hybrid experiment | Test auxiliary normal-domain pretraining | AeBAD-V normals + BladeSynth Normal, then AeBAD-S | 5 + 200; endpoints 55/105/155/205 | 8-14 h total |
-| Faster R-CNN | CNN baseline | Prove whether transformers improve aircraft results | Same aircraft split | 3 + 20, one logical run | 8-16 h |
+| Faster R-CNN | CNN baseline | Prove whether transformers improve aircraft results | Same aircraft split | 4 parts: 8/5/5/5 epochs | 8-16 h |
 | PatchCore | CNN baseline | Engine anomaly comparison | AeBAD-S normal images | One fit | 0.5-1.5 h |
 
 The combined estimate is roughly 49-94 T4 GPU-hours; these are unmeasured planning estimates.
 The notebook wrapper stops its training process group at 10.5 hours from its first clock cell.
 Start that cell immediately in a fresh session. Platform shutdowns and hangs cannot be guaranteed against.
-A 20-epoch model is attempted in one logical run; if real measured speed makes that unsafe, it stops,
-archives the completed epochs, and resumes when the same command is run again.
+Every aircraft model has four explicit parts: 3 auxiliary + 5 main epochs first, then 5 main
+epochs per later part. If time runs short within a part, it archives progress and resumes that part.
 
 ## Dataset rules
 
@@ -110,8 +110,9 @@ Run each command in its own Kaggle session/version:
 !python scripts/kaggle_train_all.py --stage train --model faster_rcnn --quarter 1 --config config.yaml
 ```
 
-These have 20 main epochs and therefore one logical part. If the time guard exits before epoch 23, save the
-Kaggle version and rerun the identical command after restoring the archive. It resumes automatically.
+These commands start part 1 only. After each completed part, download its archive and checksum,
+restore in a fresh session, and use --quarter 2, then 3, then 4. Cumulative targets are 8, 13,
+18 and 23. If the time guard exits within a part, restore and repeat that same part number.
 
 ## 5. Train engine models
 

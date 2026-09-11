@@ -42,8 +42,9 @@ def test_long_training_is_split_into_main_epoch_quarters():
     assert training_boundaries(200, auxiliary_epochs=5) == [55, 105, 155, 205]
 
 
-def test_twenty_epoch_model_stays_in_one_logical_run():
-    assert training_boundaries(20, auxiliary_epochs=3) == [23]
+def test_twenty_epoch_model_defaults_to_four_parts():
+    assert training_boundaries(20, auxiliary_epochs=3) == [8, 13, 18, 23]
+    assert training_boundaries(20, auxiliary_epochs=3, one_go_max_epochs=20) == [23]
     assert boundary_for_part([23], 1) == 23
     with pytest.raises(ValueError, match="between 1 and 1"):
         boundary_for_part([23], 2)

@@ -12,7 +12,7 @@ def training_boundaries(
     *,
     auxiliary_epochs: int = 0,
     quarter_count: int = 4,
-    one_go_max_epochs: int = 20,
+    one_go_max_epochs: int = 1,
 ) -> list[int]:
     """Return absolute completed-epoch targets for resumable runs.
 
@@ -75,4 +75,3 @@ class SessionTimeGuard:
         conservative_next_epoch = max(average_epoch, self.epoch_seconds[-1]) * 1.20
         reserve = self.packaging_reserve_minutes * 60
         return self.elapsed_seconds + conservative_next_epoch + reserve >= self.max_session_hours * 3600
-
