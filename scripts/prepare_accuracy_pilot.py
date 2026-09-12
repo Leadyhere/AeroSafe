@@ -24,39 +24,71 @@ def main() -> int:
     if args.epochs < 1:
         parser.error("--epochs must be positive.")
 
-    source_config = Path(args.config)
-    config = yaml.safe_load(source_config.read_text(encoding="utf-8"))
-    candidate = config["aircraft"]["transformer_candidates"][args.model]
-    baseline = Path(candidate["checkpoint"])
-    metadata_path = baseline / "aeroinspect_metadata.json"
-    if not metadata_path.is_file():
-        parser.error(
-            f"Finished baseline checkpoint not found at {baseline}. "
-            "Finish or restore its 23-epoch run first."
-        )
-    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
-    if metadata.get("architecture") != args.model or metadata.get("labels") != ["defect"]:
-        parser.error("Baseline architecture/labels are wrong; old 7-class weights are forbidden.")
-    import torch
-
-    baseline_state = (
-        Path(config["paths"]["checkpoints"])
+    experiment = f"{args.model}_slice_pilot"
+    output_config = Path("data") / f"{experiment}.yaml"
+    pilot_state = (
+        Path("checkpoints")
+        / experiment
         / "aircraft_candidates"
         / f"{args.model}_training_state.pt"
     )
-    expected_baseline_epochs = int(config["aircraft"]["auxiliary_pretrain_epochs"]) + int(
-        candidate.get("epochs", config["aircraft"]["epochs"])
-    )
-    if not baseline_state.is_file():
-        parser.error(f"Baseline training state is missing: {baseline_state}")
-    completed_baseline_epochs = int(
-        torch.load(baseline_state, map_location="cpu", weights_only=False)["epoch"]
-    ) + 1
-    if completed_baseline_epochs < expected_baseline_epochs:
+    resuming_pilot = pilot_state.is_file()
+    if resuming_pilot and not output_config.is_file():
         parser.error(
-            f"Baseline is only at epoch {completed_baseline_epochs}/{expected_baseline_epochs}. "
-            "Finish it before starting the accuracy pilot."
+            f"Pilot state exists but its config is missing: {output_config}. "
+            "Restore the complete pilot archive and its matching checksum."
         )
+
+    source_config = output_config if resuming_pilot else Path(args.config)
+    config = yaml.safe_load(source_config.read_text(encoding="utf-8"))
+    candidate = config["aircraft"]["transformer_candidates"][args.model]
+    if resuming_pilot:
+        pilot_metadata = config.get("accuracy_pilot", {})
+        if pilot_metadata.get("model") != args.model:
+            parser.error("Restored pilot config is for a different model.")
+        requested_recipe = {
+            "epochs": args.epochs,
+            "slice_size": args.size,
+            "max_slices_per_image": args.max_per_image,
+        }
+        stored_recipe = {key: pilot_metadata.get(key) for key in requested_recipe}
+        if stored_recipe != requested_recipe:
+            parser.error(
+                f"Pilot recipe differs from its restored state: stored={stored_recipe}, "
+                f"requested={requested_recipe}. Resume with the original arguments."
+            )
+        baseline = Path(pilot_metadata["baseline_checkpoint"])
+    else:
+        baseline = Path(candidate["checkpoint"])
+        metadata_path = baseline / "aeroinspect_metadata.json"
+        if not metadata_path.is_file():
+            parser.error(
+                f"Finished baseline checkpoint not found at {baseline}. "
+                "Finish or restore its 23-epoch run first."
+            )
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        if metadata.get("architecture") != args.model or metadata.get("labels") != ["defect"]:
+            parser.error("Baseline architecture/labels are wrong; old 7-class weights are forbidden.")
+        import torch
+
+        baseline_state = (
+            Path(config["paths"]["checkpoints"])
+            / "aircraft_candidates"
+            / f"{args.model}_training_state.pt"
+        )
+        expected_baseline_epochs = int(config["aircraft"]["auxiliary_pretrain_epochs"]) + int(
+            candidate.get("epochs", config["aircraft"]["epochs"])
+        )
+        if not baseline_state.is_file():
+            parser.error(f"Baseline training state is missing: {baseline_state}")
+        completed_baseline_epochs = int(
+            torch.load(baseline_state, map_location="cpu", weights_only=False)["epoch"]
+        ) + 1
+        if completed_baseline_epochs < expected_baseline_epochs:
+            parser.error(
+                f"Baseline is only at epoch {completed_baseline_epochs}/{expected_baseline_epochs}. "
+                "Finish it before starting the accuracy pilot."
+            )
 
     processed = Path(config["paths"]["processed"])
     original_train = processed / "aircraft/train.json"
@@ -66,7 +98,6 @@ def main() -> int:
         if not required.is_file():
             parser.error(f"Prepared data missing: {required}")
 
-    experiment = f"{args.model}_slice_pilot"
     slices = processed / "aircraft" / experiment
     sliced_train = slices / "train.json"
     if slices.exists() and not sliced_train.is_file():
@@ -110,8 +141,14 @@ def main() -> int:
     selected = config["aircraft"]["transformer_candidates"][args.model]
     selected["epochs"] = args.epochs
     selected["checkpoint"] = f"checkpoints/{experiment}/best"
+    config["accuracy_pilot"] = {
+        "model": args.model,
+        "baseline_checkpoint": str(baseline),
+        "epochs": args.epochs,
+        "slice_size": args.size,
+        "max_slices_per_image": args.max_per_image,
+    }
 
-    output_config = Path("data") / f"{experiment}.yaml"
     output_config.parent.mkdir(parents=True, exist_ok=True)
     output_config.write_text(
         yaml.safe_dump(config, sort_keys=False), encoding="utf-8"
