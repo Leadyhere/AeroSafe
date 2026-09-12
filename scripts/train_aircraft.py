@@ -23,7 +23,12 @@ from src.data import AircraftDetectionDataset, detection_sampling_weights
 from src.evaluation import evaluate_aircraft_predictions
 from src.experiment_identity import aircraft_data_identity, validate_resume_identity
 from src.preprocessing import build_aircraft_augmentation, load_image
-from src.training_artifacts import artifact_output_path, atomic_torch_save, create_training_archive
+from src.training_artifacts import (
+    artifact_output_path,
+    atomic_torch_save,
+    create_training_archive,
+    sha256_file,
+)
 from src.training_chunks import SessionTimeGuard, boundary_for_part, training_boundaries
 from src.training_monitor import (
     create_tensorboard_writer,
@@ -117,6 +122,42 @@ def warmup_cosine_multiplier(epoch: int, *, warmup_epochs: int, total_epochs: in
     return 0.5 * (1.0 + math.cos(math.pi * min(1.0, progress)))
 
 
+def initialization_identity(
+    directory: str | Path, *, architecture: str, labels: list[str]
+) -> dict[str, object]:
+    """Validate and fingerprint a trained checkpoint used as weights-only initialization."""
+    directory = Path(directory)
+    metadata_path = directory / "aeroinspect_metadata.json"
+    if not metadata_path.is_file():
+        raise ValueError(f"Initialization checkpoint metadata is missing: {metadata_path}")
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    actual_architecture = str(
+        metadata.get("architecture", metadata.get("model_name", ""))
+    )
+    actual_labels = list(metadata.get("labels", []))
+    if actual_architecture != architecture:
+        raise ValueError(
+            f"Initialization checkpoint is {actual_architecture!r}, not {architecture!r}."
+        )
+    if actual_labels != labels:
+        raise ValueError(
+            "Initialization checkpoint label taxonomy differs from the prepared data. "
+            "Do not initialize the binary detector from old 7-class weights."
+        )
+    weight_files = sorted(
+        [*directory.glob("*.safetensors"), *directory.glob("pytorch_model*.bin")],
+        key=lambda path: path.name,
+    )
+    if not weight_files:
+        raise ValueError(f"No model weights found in initialization checkpoint: {directory}")
+    return {
+        "architecture": actual_architecture,
+        "labels": actual_labels,
+        "weights": {path.name: sha256_file(path) for path in weight_files},
+        "metadata_sha256": sha256_file(metadata_path),
+    }
+
+
 def main() -> int:
     import torch
     from torch.utils.data import DataLoader, Subset, WeightedRandomSampler
@@ -130,6 +171,14 @@ def main() -> int:
         help="Transformer candidate key from aircraft.transformer_candidates.",
     )
     parser.add_argument("--resume", default=None)
+    parser.add_argument(
+        "--initialize-from",
+        default=None,
+        help=(
+            "Start a new experiment from a trained AeroInspect model directory. "
+            "Only model weights are reused; optimizer and scheduler start fresh."
+        ),
+    )
     parser.add_argument("--quarter", type=int, default=None)
     parser.add_argument("--max-session-hours", type=float, default=None)
     parser.add_argument(
@@ -142,6 +191,8 @@ def main() -> int:
         ),
     )
     args = parser.parse_args()
+    if args.resume and args.initialize_from:
+        parser.error("Use --resume or --initialize-from, not both.")
     config = load_config(args.config)
     aircraft_config = config["aircraft"]
     candidates = aircraft_config.get("transformer_candidates", {})
@@ -174,6 +225,21 @@ def main() -> int:
         image_size=candidate_image_size,
         confidence_threshold=float(aircraft_config["confidence_threshold"]),
     )
+    initialization = None
+    if args.initialize_from:
+        initialization = initialization_identity(
+            args.initialize_from, architecture=candidate_name, labels=labels
+        )
+        # Keep the temporary source model on CPU so initialization does not
+        # momentarily hold two complete detectors in scarce Kaggle GPU memory.
+        trained = AircraftDetector.load(args.initialize_from, device=torch.device("cpu"))
+        detector.model.load_state_dict(trained.model.state_dict(), strict=True)
+        del trained
+        print(
+            f"Initialized {candidate_name} from trained weights at {args.initialize_from}; "
+            "optimizer and scheduler are new.",
+            flush=True,
+        )
     train_dataset = AircraftDetectionDataset(
         train_file,
         detector.processor,
@@ -297,12 +363,21 @@ def main() -> int:
     }
     if candidate_name == "deformable_detr":
         experiment_identity["loading_policy"] = "explicit_cpu_native_fp32_v1"
+    if initialization is not None:
+        experiment_identity["initialization"] = initialization
     if resume_path is None and args.quarter is not None and training_state.is_file():
         resume_path = training_state
     if args.quarter is not None and args.quarter > 1 and resume_path is None:
         parser.error(f"Part {args.quarter} requires the previous state at {training_state}.")
     if resume_path is not None:
         state = torch.load(resume_path, map_location=detector.device, weights_only=False)
+        stored_initialization = (
+            state.get("metadata", {})
+            .get("experiment_identity", {})
+            .get("initialization")
+        )
+        if stored_initialization is not None:
+            experiment_identity["initialization"] = stored_initialization
         validate_resume_identity(state, experiment_identity)
         resumed_architecture = state.get("architecture")
         if resumed_architecture is not None and resumed_architecture != candidate_name:
