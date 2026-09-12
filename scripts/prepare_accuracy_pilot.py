@@ -37,6 +37,26 @@ def main() -> int:
     metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
     if metadata.get("architecture") != args.model or metadata.get("labels") != ["defect"]:
         parser.error("Baseline architecture/labels are wrong; old 7-class weights are forbidden.")
+    import torch
+
+    baseline_state = (
+        Path(config["paths"]["checkpoints"])
+        / "aircraft_candidates"
+        / f"{args.model}_training_state.pt"
+    )
+    expected_baseline_epochs = int(config["aircraft"]["auxiliary_pretrain_epochs"]) + int(
+        candidate.get("epochs", config["aircraft"]["epochs"])
+    )
+    if not baseline_state.is_file():
+        parser.error(f"Baseline training state is missing: {baseline_state}")
+    completed_baseline_epochs = int(
+        torch.load(baseline_state, map_location="cpu", weights_only=False)["epoch"]
+    ) + 1
+    if completed_baseline_epochs < expected_baseline_epochs:
+        parser.error(
+            f"Baseline is only at epoch {completed_baseline_epochs}/{expected_baseline_epochs}. "
+            "Finish it before starting the accuracy pilot."
+        )
 
     processed = Path(config["paths"]["processed"])
     original_train = processed / "aircraft/train.json"
