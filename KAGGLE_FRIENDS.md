@@ -1,5 +1,8 @@
 # Copy-and-paste Kaggle instructions
 
+For the Deformable DETR NaN failure, use [the recovery cells](KAGGLE_DEFORMABLE_RECOVERY.md).
+They retain the working dataset paths and use explicit 12/23 cycle targets.
+
 Accuracy-integrity update: read [ACCURACY_PLAN.md](ACCURACY_PLAN.md) before starting new runs.
 Use fresh states from this revision; older checkpoint recipes are rejected. Aircraft notebooks
 should attach `aerosafe-group-manifest-v2` alongside the original datasets. Final-test evaluation

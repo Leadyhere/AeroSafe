@@ -60,23 +60,42 @@ class AircraftDetector:
                     "longest_edge": int(image_size),
                 }
         self.processor = AutoImageProcessor.from_pretrained(pretrained_model, **processor_kwargs)
-        self.model = AutoModelForObjectDetection.from_pretrained(
-            pretrained_model,
-            num_labels=len(self.labels),
-            id2label=self.id2label,
-            label2id=self.label2id,
-            ignore_mismatched_sizes=True,
-            local_files_only=local_files_only,
-        ).to(self.device)
+        if self.architecture == "deformable_detr":
+            from .deformable_loading import load_deformable_checkpoint
+
+            self.model = load_deformable_checkpoint(
+                pretrained_model, labels=self.labels, local_files_only=local_files_only,
+            ).to(self.device)
+        else:
+            self.model = AutoModelForObjectDetection.from_pretrained(
+                pretrained_model,
+                num_labels=len(self.labels),
+                id2label=self.id2label,
+                label2id=self.label2id,
+                ignore_mismatched_sizes=True,
+                local_files_only=local_files_only,
+            ).to(self.device)
         self.version = "untrained-transfer-head"
         self.metadata: dict[str, Any] = {}
 
     def training_forward(
         self, pixel_values: Any, pixel_mask: Any | None, labels: list[dict[str, Any]]
     ):
+        import torch
+
+        if not torch.isfinite(pixel_values).all():
+            raise ValueError("Non-finite training image tensor before model forward.")
+        for target in labels:
+            boxes = target["boxes"]
+            if not torch.isfinite(boxes).all() or (boxes[:, 2:] <= 0).any():
+                raise ValueError(f"Invalid target boxes before model forward; image_id={target.get('image_id')}")
         arguments = {"pixel_values": pixel_values, "labels": labels}
         if pixel_mask is not None and "pixel_mask" in inspect.signature(self.model.forward).parameters:
             arguments["pixel_mask"] = pixel_mask
+        if self.architecture == "deformable_detr":
+            with torch.autocast(device_type=self.device.type, enabled=False):
+                arguments["pixel_values"] = pixel_values.float()
+                return self.model(**arguments)
         return self.model(**arguments)
 
     def predict(self, image: Any, threshold: float | None = None) -> list[dict[str, Any]]:
@@ -152,9 +171,14 @@ class AircraftDetector:
         instance.device = device or select_device()
         instance.confidence_threshold = float(metadata.get("confidence_threshold", 0.5))
         instance.processor = AutoImageProcessor.from_pretrained(directory, local_files_only=True)
-        instance.model = AutoModelForObjectDetection.from_pretrained(
-            directory, local_files_only=True
-        ).to(instance.device)
+        if instance.architecture == "deformable_detr":
+            from .deformable_loading import load_deformable_checkpoint
+
+            instance.model = load_deformable_checkpoint(directory, local_files_only=True).to(instance.device)
+        else:
+            instance.model = AutoModelForObjectDetection.from_pretrained(
+                directory, local_files_only=True
+            ).to(instance.device)
         instance.metadata = metadata
         instance.version = str(metadata.get("version", directory.name))
         return instance

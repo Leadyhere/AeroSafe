@@ -192,9 +192,11 @@ def main() -> int:
     )
     train_sampler = None
     auxiliary_sampler = None
+    smoke_batches = 3 if candidate_name == "deformable_detr" else 1
     if args.mode == "smoke":
-        train_dataset = Subset(train_dataset, range(min(2, len(train_dataset))))
-        auxiliary_dataset = Subset(auxiliary_dataset, range(min(2, len(auxiliary_dataset))))
+        smoke_samples = max(2, smoke_batches)
+        train_dataset = Subset(train_dataset, range(min(smoke_samples, len(train_dataset))))
+        auxiliary_dataset = Subset(auxiliary_dataset, range(min(smoke_samples, len(auxiliary_dataset))))
     else:
         max_sampling_weight = float(
             config["dataset"].get("class_balance_max_sampling_weight", 4.0)
@@ -262,7 +264,8 @@ def main() -> int:
             epoch, warmup_epochs=warmup_epochs, total_epochs=total_epochs
         ),
     )
-    amp_enabled = bool(config["training"]["mixed_precision"]) and detector.device.type == "cuda"
+    amp_enabled = (bool(config["training"]["mixed_precision"])
+                   and detector.device.type == "cuda" and candidate_name != "deformable_detr")
     scaler = torch.amp.GradScaler("cuda", enabled=amp_enabled)
     checkpoint_root = Path(config["paths"]["checkpoints"])
     reports_root = Path(config["paths"]["reports"])
@@ -292,6 +295,8 @@ def main() -> int:
                    if key not in {"checkpoint", "transformer_candidates", "training_annotations_override"}},
         "candidate": {key: value for key, value in candidate_config.items() if key != "checkpoint"},
     }
+    if candidate_name == "deformable_detr":
+        experiment_identity["loading_policy"] = "explicit_cpu_native_fp32_v1"
     if resume_path is None and args.quarter is not None and training_state.is_file():
         resume_path = training_state
     if args.quarter is not None and args.quarter > 1 and resume_path is None:
@@ -368,6 +373,10 @@ def main() -> int:
                 group_size = min(accumulation, len(loader) - group_start)
                 loss = raw_loss / group_size
             loss_value = float(raw_loss.detach())
+            if not math.isfinite(loss_value):
+                raise FloatingPointError(
+                    f"Non-finite loss before backward: epoch={epoch + 1}, batch={step + 1}, phase={phase}."
+                )
             epoch_loss += loss_value
             epoch_batches += 1
             global_step += 1
@@ -383,12 +392,13 @@ def main() -> int:
             if (step + 1) % accumulation == 0 or step + 1 == len(loader):
                 scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(
-                    detector.model.parameters(), float(aircraft_config["max_grad_norm"])
+                    detector.model.parameters(), float(aircraft_config["max_grad_norm"]),
+                    error_if_nonfinite=True,
                 )
                 scaler.step(optimizer)
                 scaler.update()
                 optimizer.zero_grad(set_to_none=True)
-            if args.mode == "smoke":
+            if args.mode == "smoke" and step + 1 >= smoke_batches:
                 break
         scheduler.step()
         time_guard.record_epoch(time.monotonic() - epoch_started)
